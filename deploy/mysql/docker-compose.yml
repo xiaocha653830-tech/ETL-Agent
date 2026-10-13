@@ -1,0 +1,27 @@
+# ============================================================
+# ETL-Agent 演示源库（MySQL 8.0）—— 仅用于本地端到端验证
+#
+# 说明：本容器是【演示数据源】，模拟上游业务库（SPEC 中"不可控、只读探查"的源端）。
+# 端口用 3307，避免与本机已有的 3306 MySQL 冲突。
+#
+# 启动：docker compose up -d
+# 连接：mysql -h127.0.0.1 -P3307 -uroot -petl_demo_pwd demo
+# ============================================================
+services:
+  mysql-source:
+    image: mysql:8.0.45
+    container_name: etl-mysql-source
+    environment:
+      MYSQL_ROOT_PASSWORD: etl_demo_pwd
+      MYSQL_DATABASE: demo
+    ports:
+      - "3307:3306"
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - mysql-source-data:/var/lib/mysql
+
+volumes:
+  mysql-source-data:

@@ -1,0 +1,64 @@
+# ============================================================
+# ETL-Agent 控制面基础设施
+# 依据：SPEC-ETL-Agent-v1.0 §4 部署拓扑（Docker Compose 单机）
+#
+# T-01 范围：起 PostgreSQL / Redis / Vault 三个基础服务。
+# 应用（api / worker / beat）在开发期用本地进程跑，后续阶段再纳入本 compose。
+#
+# 启动：docker compose up -d
+# 注意：本文件与 deploy/doris、deploy/mysql 相互独立，互不影响。
+# ============================================================
+services:
+  postgres:
+    image: postgres:16
+    container_name: etl-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-etl}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-etl_dev_pwd}
+      POSTGRES_DB: ${POSTGRES_DB:-etl_agent}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-etl} -d ${POSTGRES_DB:-etl_agent}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7
+    container_name: etl-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  vault:
+    image: hashicorp/vault:1.17
+    container_name: etl-vault
+    cap_add:
+      - IPC_LOCK
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: ${VAULT_TOKEN:-dev-root-token}
+      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+    ports:
+      - "8200:8200"
+    volumes:
+      - vaultdata:/vault/file
+    healthcheck:
+      test: ["CMD", "vault", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pgdata:
+  redisdata:
+  vaultdata:

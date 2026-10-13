@@ -1,0 +1,39 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# ---- 环境与密钥（严禁入库）----
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+*.crt
+
+# ---- 本地数据 ----
+*.db
+*.sqlite3
+*.log
+logs/
+
+# ---- 第三方发行包（SeaTunnel 2.3.13 本地发行包，约 500MB，不入库）----
+# 安装与连接器准备步骤见 deploy/README.md 第二节
+seatunnel/
+
+# ---- 前端 ----
+node_modules/
+dist/
+.vite/
+
+# ---- IDE / OS ----
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

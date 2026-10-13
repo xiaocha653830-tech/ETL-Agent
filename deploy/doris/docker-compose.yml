@@ -1,0 +1,68 @@
+# ============================================================
+# Apache Doris 2.1.7 单机部署（1 FE + 1 BE）—— 开发 / 演示环境
+# 依据：SPEC-ETL-Agent-v1.0 §11.1 V1（目标库需 Doris >= 2.0）
+#
+# 启动：docker compose up -d
+# 连接：mysql -h127.0.0.1 -P8050 -uroot
+#
+# 【关键设计】BE 与 FE 共享网络命名空间（network_mode: service:doris-fe）
+#   原因：Windows Docker Desktop (WSL2) 下，容器 IP 对宿主机不可路由，
+#   而 Doris Stream Load 要求客户端拿到 FE 返回的 BE 地址后【直连 BE】。
+#   共享命名空间后 BE 以 127.0.0.1 上报，FE 与宿主机（经映射端口）都能连上，
+#   宿主机上的 SeaTunnel 因此可以正常写入 Doris。
+#
+# 【端口说明】宿主映射须避让 Windows 保留段（实测 8978-9077 含 9030）：
+#   8030 = FE HTTP      8050 -> 9030 = FE MySQL 协议      8040 = BE HTTP
+# ============================================================
+services:
+  doris-fe:
+    image: apache/doris:doris-fe-2.1.7
+    container_name: etl-doris-fe
+    hostname: doris-fe
+    environment:
+      FE_SERVERS: "fe1:127.0.0.1:9010"
+      FE_ID: "1"
+    ports:
+      - "8030:8030"   # FE HTTP：Stream Load 提交、元数据 API
+      - "8050:9030"   # FE MySQL 协议（宿主 8050）：9030 被 Windows 动态保留
+      - "8040:8040"   # BE HTTP：因 BE 共享本网络命名空间，端口在此映射
+    networks:
+      doris-net:
+        ipv4_address: 172.30.80.3
+    volumes:
+      - doris-fe-meta:/opt/apache-doris/fe/doris-meta
+      - doris-fe-log:/opt/apache-doris/fe/log
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8030/api/bootstrap || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+
+  doris-be:
+    image: apache/doris:doris-be-2.1.7
+    container_name: etl-doris-be
+    # 与 FE 共享网络命名空间：BE 以 127.0.0.1 暴露，FE 与宿主机均可达
+    network_mode: "service:doris-fe"
+    environment:
+      FE_SERVERS: "fe1:127.0.0.1:9010"
+      BE_ADDR: "127.0.0.1:9050"
+    depends_on:
+      doris-fe:
+        condition: service_healthy
+    volumes:
+      - doris-be-storage:/opt/apache-doris/be/storage
+      - doris-be-log:/opt/apache-doris/be/log
+
+networks:
+  doris-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.80.0/24
+
+volumes:
+  doris-fe-meta:
+  doris-fe-log:
+  doris-be-storage:
+  doris-be-log:
