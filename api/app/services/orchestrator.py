@@ -53,6 +53,7 @@ class GenerationState(TypedDict, total=False):
     塞 dataclass 会在保存 checkpoint 时失败。
     """
 
+    # 稳定输入：从建图到恢复都不应变化，也是配置渲染与制品追踪的依据。
     run_id: str
     requirement: str
     source_datasource_id: str
@@ -62,14 +63,17 @@ class GenerationState(TypedDict, total=False):
     source_meta: dict[str, Any]
     target_meta: dict[str, Any]
 
+    # 需求理解阶段：补充答案跨 checkpoint 累积，parsed 可在每轮澄清后重新生成。
     clarifications: dict[str, Any]
     parsed: dict[str, Any]
     pending_questions: list[dict[str, Any]]
 
+    # 算子匹配阶段：不支持是正常业务出口，不应被包装成系统异常。
     supported: bool
     steps: list[dict[str, Any]]
     unsupported_reason: str
 
+    # 最终产物：结构化方案先生成，确定性配置随后由方案渲染。
     plan: dict[str, Any]
     config: str
     warnings: list[str]
@@ -81,6 +85,7 @@ class GenerationState(TypedDict, total=False):
 
 
 def _normalize_questions(raw: Any) -> list[dict[str, Any]]:
+    # 模型输出位于信任边界之外：只保留满足最小契约的对象，并限制文本与选项规模。
     questions: list[dict[str, Any]] = []
     for item in raw or []:
         if not isinstance(item, dict):
@@ -213,6 +218,7 @@ def build_generation_graph(llm: LLMClient, checkpointer: Any):
         """
         answers = interrupt({"questions": state.get("pending_questions") or []})
         merged = dict(state.get("clarifications") or {})
+        # 同 key 的新回答覆盖旧值，使用户可以在后续澄清中修正先前输入。
         merged.update(_normalize_answers(answers))
         return {"clarifications": merged, "pending_questions": []}
 
@@ -247,6 +253,7 @@ def build_generation_graph(llm: LLMClient, checkpointer: Any):
             for step in steps
             if get_operator(step["operator_id"]) is None
         ]
+        # 注册表是最终可信边界；即使提示词已限制候选，仍不能直接信任模型输出。
         if unknown:
             reason = f"模型返回了未注册的算子：{'、'.join(unknown)}"
             logger.warning("算子幻觉已拦截：%s", unknown)
@@ -310,6 +317,7 @@ def build_generation_graph(llm: LLMClient, checkpointer: Any):
         return "continue" if state.get("supported") else "stop"
 
     graph = StateGraph(GenerationState)
+    # 节点只返回增量字段，由 LangGraph 合并进共享状态并交给 checkpointer 持久化。
     graph.add_node("parse_requirement", parse_requirement)
     graph.add_node("ask_clarification", ask_clarification)
     graph.add_node("match_operators", match_operators)
@@ -406,6 +414,7 @@ def build_initial_state(
         "target_context": target.to_prompt_text(),
         "source_meta": {
             "datasource_id": source.datasource_id,
+            "profile_id": source.profile_id,
             "name": source.name,
             "type": source.type,
             "config": source.config,
@@ -413,6 +422,7 @@ def build_initial_state(
         },
         "target_meta": {
             "datasource_id": target.datasource_id,
+            "profile_id": target.profile_id,
             "name": target.name,
             "type": target.type,
             "config": target.config,

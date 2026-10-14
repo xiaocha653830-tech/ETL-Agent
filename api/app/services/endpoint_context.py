@@ -19,8 +19,11 @@ class EndpointContext:
     name: str
     type: str
     config: dict[str, Any] = field(default_factory=dict)
-    # 来自最新 METADATA_PROFILE 的 schema_json["tables"]
+    # 来自某个 METADATA_PROFILE 的 schema_json["tables"]
     tables: list[dict[str, Any]] = field(default_factory=list)
+    # 本上下文依据的探查记录 id。生成时绑定、冻结时按此还原，
+    # 避免「生成看的是 Profile v1、冻结时读到的却是重新探查后的 v2」。
+    profile_id: str | None = None
 
     @property
     def table_names(self) -> list[str]:
@@ -43,6 +46,7 @@ class EndpointContext:
             lines.append("表结构：**尚未执行元数据探查，可用表未知**")
             return "\n".join(lines)
 
+        # 上下文截断只控制模型输入规模；完整 Schema 仍保留在 tables 中供确定性门禁使用。
         lines.append(f"可用表（共 {len(self.tables)} 张，最多展示 {max_tables} 张）：")
         for table in self.tables[:max_tables]:
             lines.append(f"- {table.get('name')}（整表分级 {table.get('max_level', 'L2')}）")

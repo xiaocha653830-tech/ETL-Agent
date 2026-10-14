@@ -2,6 +2,7 @@
 
 import json
 import uuid
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -329,3 +330,226 @@ def test_versions_are_project_scoped(client: TestClient, ctx, auth_headers, stub
         ).status_code
         == 403
     )
+
+
+# --------------------------------------------------------------------------
+# 探查记录绑定（FR-19 依据一致性）
+# --------------------------------------------------------------------------
+
+
+def _profile(
+    session_factory,
+    datasource_id: str,
+    *,
+    table: str,
+    columns: list[str],
+    sampled_at: datetime,
+) -> str:
+    """落一条探查记录。
+
+    测试不真连数据库——门禁只读 ``schema_json["tables"]``，直接照这个形状造即可。
+    """
+    from app.models.datasource import MetadataProfile
+
+    with session_factory() as db:
+        record = MetadataProfile(
+            datasource_id=uuid.UUID(datasource_id),
+            schema_json={
+                "tables": [
+                    {
+                        "name": table,
+                        "max_level": "L2",
+                        "columns": [
+                            {"name": name, "type": "varchar", "level": "L2"}
+                            for name in columns
+                        ],
+                    }
+                ],
+                "table_count": 1,
+                "column_count": len(columns),
+            },
+            sensitivity_tags={},
+            max_level="L2",
+            sampled_at=sampled_at,
+            tables_scanned=1,
+        )
+        db.add(record)
+        db.commit()
+        return str(record.id)
+
+
+def _schema_check(gate_report: dict) -> dict:
+    return next(c for c in gate_report["checks"] if c["name"] == "Schema 对齐")
+
+
+def test_freeze_reuses_profile_bound_at_generation(
+    client: TestClient, ctx, stubs, session_factory
+):
+    """冻结必须按**生成时绑定**的探查记录还原 Schema，而不是重新取「最新」。
+
+    这是本项修复的核心断言：生成后又探查过一次的情况下，
+    「取最新」会让一份本来合法的方案被判不对齐。
+    """
+    base = datetime(2026, 1, 1, tzinfo=UTC)
+    src_v1 = _profile(
+        session_factory, ctx["source_id"], table="orders",
+        columns=["order_id"], sampled_at=base,
+    )
+    tgt_v1 = _profile(
+        session_factory, ctx["target_id"], table="orders_wide",
+        columns=["order_id"], sampled_at=base,
+    )
+
+    _generate(client, ctx, [PARSE_OK, MATCH_OK, PLAN_V1], stubs)
+    version_id = _versions(client, ctx)[0]["id"]
+
+    detail = client.get(f"/api/v1/versions/{version_id}", headers=ctx["headers"]).json()
+    assert detail["source_profile_id"] == src_v1
+    assert detail["target_profile_id"] == tgt_v1
+
+    # 生成之后重新探查：v2 里两端都不再有 order_id。
+    # 若冻结退回「读最新」，这次冻结会因 Schema 不对齐而失败。
+    later = base + timedelta(days=1)
+    _profile(
+        session_factory, ctx["source_id"], table="orders",
+        columns=["another_col"], sampled_at=later,
+    )
+    _profile(
+        session_factory, ctx["target_id"], table="orders_wide",
+        columns=["another_col"], sampled_at=later,
+    )
+
+    resp = client.post(f"/api/v1/versions/{version_id}/freeze", headers=ctx["headers"])
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "frozen"
+
+
+def test_freeze_fails_when_bound_profile_disappeared(
+    client: TestClient, ctx, stubs, session_factory
+):
+    """绑定过探查记录、冻结时记录已不可用 → 「无从校验」，判 failed 而不是 skipped。"""
+    from sqlalchemy import delete
+
+    from app.models.datasource import MetadataProfile
+
+    base = datetime(2026, 1, 1, tzinfo=UTC)
+    _profile(
+        session_factory, ctx["source_id"], table="orders",
+        columns=["order_id"], sampled_at=base,
+    )
+    _profile(
+        session_factory, ctx["target_id"], table="orders_wide",
+        columns=["order_id"], sampled_at=base,
+    )
+
+    _generate(client, ctx, [PARSE_OK, MATCH_OK, PLAN_V1], stubs)
+    version_id = _versions(client, ctx)[0]["id"]
+
+    # 模拟数据源被删（探查记录随之级联清理）
+    with session_factory() as db:
+        db.execute(
+            delete(MetadataProfile).where(
+                MetadataProfile.datasource_id == uuid.UUID(ctx["source_id"])
+            )
+        )
+        db.commit()
+
+    resp = client.post(f"/api/v1/versions/{version_id}/freeze", headers=ctx["headers"])
+    assert resp.status_code == 409
+
+    after = client.get(f"/api/v1/versions/{version_id}", headers=ctx["headers"]).json()
+    assert after["status"] == "rejected"
+    assert after["sha256"] is None
+    assert _schema_check(after["gate_report"])["status"] == "failed"
+
+
+def test_freeze_without_any_profile_is_skipped_in_dev(client: TestClient, ctx, stubs):
+    """从未探查过 → 开发环境记 ``skipped``（联调不受阻），与「记录被删」区别对待。"""
+    _generate(client, ctx, [PARSE_OK, MATCH_OK, PLAN_V1], stubs)
+    version_id = _versions(client, ctx)[0]["id"]
+
+    resp = client.post(f"/api/v1/versions/{version_id}/freeze", headers=ctx["headers"])
+    assert resp.status_code == 200, resp.text
+
+    body = resp.json()
+    assert body["status"] == "frozen"
+    check = _schema_check(body["gate_report"])
+    assert check["status"] == "skipped"
+    assert body["source_profile_id"] is None
+
+
+# --------------------------------------------------------------------------
+# 生成异常收敛（不允许 run 悬挂在 running）
+# --------------------------------------------------------------------------
+
+
+def _post_generate(client: TestClient, ctx: dict):
+    return client.post(
+        "/api/v1/pipelines/generate",
+        json={
+            "project_id": ctx["project_id"],
+            "requirement": "把 orders 同步到 Doris",
+            "source_datasource_id": ctx["source_id"],
+            "target_datasource_id": ctx["target_id"],
+        },
+        headers=ctx["headers"],
+    )
+
+
+def test_model_failure_marks_run_failed(client: TestClient, ctx, stubs, session_factory):
+    """模型不可用时必须落 failed 终态——否则前端轮询永远等不到结果。"""
+    from sqlalchemy import select
+
+    from app.models.pipeline import PipelineRun, PipelineRunStatus
+
+    stubs([])  # 脚本为空：第一步调用即 ModelUnavailable
+    resp = _post_generate(client, ctx)
+    assert resp.status_code == 503
+    assert resp.json()["code"] == "SYS_MODEL_UNAVAILABLE"
+
+    with session_factory() as db:
+        run = db.scalar(select(PipelineRun))
+        assert run is not None
+        assert run.status is PipelineRunStatus.FAILED
+        assert run.error
+
+
+def test_unexpected_exception_marks_run_failed(
+    client: TestClient, ctx, monkeypatch, session_factory
+):
+    """未预期的异常同样收敛为 failed，且**不外泄内部细节**。"""
+    from langgraph.checkpoint.memory import InMemorySaver
+    from sqlalchemy import select
+
+    from app.api.routes import pipelines as routes
+    from app.models.pipeline import PipelineRun, PipelineRunStatus
+
+    monkeypatch.setattr(routes, "get_checkpointer", lambda: InMemorySaver())
+
+    class _Boom:
+        def complete(self, *_args, **_kwargs):
+            raise RuntimeError("内部细节不该外泄")
+
+        def complete_json(self, *_args, **_kwargs):
+            raise RuntimeError("内部细节不该外泄")
+
+    monkeypatch.setattr(routes, "get_llm_client", lambda: _Boom())
+
+    resp = _post_generate(client, ctx)
+    assert resp.status_code == 503
+    assert "内部细节" not in resp.text
+
+    with session_factory() as db:
+        run = db.scalar(select(PipelineRun))
+        assert run is not None
+        assert run.status is PipelineRunStatus.FAILED
+        assert "内部细节" not in (run.error or "")
+
+
+def test_failed_generation_leaves_no_draft_version(
+    client: TestClient, ctx, stubs, session_factory
+):
+    """异常路径不得留下半成品草稿。"""
+    stubs([])
+    _post_generate(client, ctx)
+    assert _versions(client, ctx) == []

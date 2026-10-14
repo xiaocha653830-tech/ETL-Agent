@@ -90,6 +90,7 @@ def build_engine(spec: ConnectionSpec) -> Engine:
         raise DatasourceUnreachable("连接配置缺少 host")
 
     port = spec.config.get("port")
+    # 使用 URL.create 而不是字符串拼接，确保口令中的 @、: 等字符被驱动正确转义。
     url = URL.create(
         drivername=drivername,
         username=spec.secret.get("username") or None,
@@ -157,6 +158,7 @@ class SqlAlchemyMetadataSource:
     def list_tables(self) -> list[str]:
         names = list(self._inspector.get_table_names(schema=self._schema))
         names += list(self._inspector.get_view_names(schema=self._schema))
+        # 固定顺序让相同库结构生成稳定快照，避免无意义的版本差异。
         return sorted(names)
 
     def list_columns(self, table: str) -> list[dict[str, Any]]:
@@ -167,6 +169,7 @@ class SqlAlchemyMetadataSource:
 
         单个字段采样失败（如二进制列、权限不足）不应中断整次探查。
         """
+        # 通过 SQLAlchemy 标识符对象构造查询，避免把表名、字段名直接拼接进 SQL。
         col = sa_column(column)
         stmt = (
             select(col)
@@ -294,6 +297,7 @@ def profile_datasource(
 
     profiles: list[TableProfile] = []
     for table_name in tables:
+        # 原始样本只在 _profile_column 内短暂存在；返回到这里时已经完成分级和脱敏。
         columns = [
             _profile_column(source, table_name, column, sample_size)
             for column in source.list_columns(table_name)

@@ -60,6 +60,7 @@ def requires_plan_attribute(attribute_name: str) -> bool:
 def _render_value(attribute_name: str, value: Any, *, endpoint: str) -> str:
     """渲染单个属性值。"""
     if is_injected_attribute(attribute_name):
+        # 占位符只表达“运行时从哪一端注入”，绝不复用模型给出的潜在敏感值。
         tail = attribute_name.rsplit(".", 1)[-1].upper()
         return f'"${{{endpoint}_{tail}}}"'
 
@@ -89,6 +90,7 @@ def _render_operator_block(
     extra_attributes: dict[str, str] | None = None,
 ) -> str:
     operator_name = step["operator_id"].rsplit(".", 1)[-1]
+    # 在副本上补充系统属性，避免渲染动作反向修改已冻结或待冻结的方案对象。
     attributes: dict[str, Any] = dict(step.get("attributes") or {})
     attributes.update(extra_attributes or {})
 
@@ -109,6 +111,7 @@ def render_seatunnel_config(
 ) -> str:
     """把 EtlPlan 渲染成可提交给 SeaTunnel 的 HOCON 配置文本。"""
     steps: list[dict[str, Any]] = list(plan.get("steps") or [])
+    # P0 配置是单源单目标链；转换信息保留在 EtlPlan，后续扩展 transform 块时再渲染。
     source_step = _pick_step(steps, "source")
     sink_step = _pick_step(steps, "sink")
 

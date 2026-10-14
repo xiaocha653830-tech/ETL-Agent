@@ -61,6 +61,7 @@ def extract_json(raw: str) -> dict[str, Any]:
         raise ModelOutputInvalid("模型返回空内容")
 
     if text.startswith("```"):
+        # 仅剥离完整的外层代码围栏，不对 JSON 内容本身做任何“修复”。
         text = re.sub(r"^```[A-Za-z0-9_-]*\s*", "", text)
         text = re.sub(r"\s*```$", "", text).strip()
 
@@ -105,6 +106,7 @@ class DeepSeekClient:
             "temperature": temperature,
         }
         if json_mode:
+            # 服务端仍会再次解析和校验；JSON mode 只是降低模型输出自由文本的概率。
             body["response_format"] = {"type": "json_object"}
         return body
 

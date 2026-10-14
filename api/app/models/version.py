@@ -67,6 +67,20 @@ class PipelineVersion(Base, TimestampMixin):
         nullable=False,
     )
 
+    # 生成该方案时依据的探查记录（FR-05 / FR-07）。
+    # 冻结时按此还原 Schema，而不是重新取「最新 Profile」——否则中间重新探查过，
+    # 就会出现「生成依据 v1、校验依据 v2」的错配，冻结结论失去意义。
+    source_profile_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("metadata_profiles.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    target_profile_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("metadata_profiles.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
     # 冻结时计算的内容摘要（FR-19）；draft 阶段为空
     sha256: Mapped[str | None] = mapped_column(String(64), nullable=True, unique=True, index=True)
     frozen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

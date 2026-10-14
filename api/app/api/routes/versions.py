@@ -11,11 +11,13 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.deps import CurrentUser, DbSession, ensure_role, require_project_member
-from app.api.routes.pipelines import build_endpoint
+from app.api.routes.pipelines import build_endpoint_from_profile
+from app.core.config import settings
 from app.core.errors import ResourceNotFound
 from app.models.identity import Membership, User, UserRole
 from app.models.version import PipelineVersion, VersionStatus
 from app.schemas.version import VersionDiffOut, VersionOut, VersionSummaryOut
+from app.services.endpoint_context import EndpointContext
 from app.services.gate import run_gate
 from app.services.versioning import diff_versions, freeze_version
 
@@ -32,13 +34,36 @@ def _authorized_version(
     return version, membership
 
 
-def _endpoint_for(db: Session, datasource_id: str | None, user: User):
-    """按版本里记录的源 / 目标数据源还原探查上下文，供 Schema 对齐检查使用。"""
-    if not datasource_id:
-        return None
+def _endpoint_for(
+    db: Session, version: PipelineVersion, *, is_source: bool, user: User
+) -> EndpointContext | None:
+    """按版本**绑定的探查记录**还原一端上下文，供 Schema 对齐检查使用。
+
+    冻结必须复用生成时那一版 Schema，不能重新取「最新 Profile」。三种情况刻意分开：
+
+    - **从未探查**（生成时就没有绑定）→ 返回 ``tables`` 为空的空上下文，
+      由门禁按「缺探查结果」处理（开发环境 ``skipped``、生产环境 ``failed``）；
+    - **绑定过但记录已不可用**（数据源或探查记录被删）→ 返回 ``None``，
+      门禁按 ``failed`` 处理：这是「无从校验」，不是「没校验」；
+    - **跨租户 / 权限异常**→ 直接向上冒泡。那是对调用方的明确拒绝，绝不能悄悄
+      降级成「本项没检查」，否则相当于用一次权限错误换一次放行。
+    """
+    profile_id = version.source_profile_id if is_source else version.target_profile_id
+    plan = version.etl_plan or {}
+    side = "source" if is_source else "target"
+
+    if profile_id is None:
+        return EndpointContext(
+            datasource_id=str(plan.get(f"{side}_datasource_id") or ""),
+            name="",
+            type="",
+            config={},
+            tables=[],
+        )
+
     try:
-        return build_endpoint(db, uuid.UUID(str(datasource_id)), user)
-    except Exception:  # noqa: BLE001 —— 数据源已删除等情况不该阻断冻结
+        return build_endpoint_from_profile(db, profile_id, user)
+    except ResourceNotFound:
         return None
 
 
@@ -53,14 +78,16 @@ def freeze(
     version, membership = _authorized_version(db, version_id, user)
     ensure_role(membership, UserRole.MAKER)
 
-    source = _endpoint_for(db, (version.etl_plan or {}).get("source_datasource_id"), user)
-    target = _endpoint_for(db, (version.etl_plan or {}).get("target_datasource_id"), user)
+    source = _endpoint_for(db, version, is_source=True, user=user)
+    target = _endpoint_for(db, version, is_source=False, user=user)
 
     report = run_gate(
         plan=version.etl_plan or {},
         config=version.config or "",
         source=source,
         target=target,
+        # 开发环境允许「没探查就冻结」以便联调；其余环境必须有探查依据才放行。
+        strict=settings.app_env != "dev",
     )
     return freeze_version(db, version=version, report=report)
 

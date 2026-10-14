@@ -25,6 +25,10 @@ class VersionOut(VersionSummaryOut):
     """详情用——含冻结时的完整快照与门禁报告。"""
 
     run_id: uuid.UUID | None
+    # 生成与冻结共同依据的探查记录。审批界面据此展示「本次校验基于哪一版 Schema」，
+    # 也让「生成后又重新探查过」这件事变得可见（FR-19 依据一致性）。
+    source_profile_id: uuid.UUID | None
+    target_profile_id: uuid.UUID | None
     etl_plan: dict[str, Any]
     config: str
     quality_rules: list[Any]

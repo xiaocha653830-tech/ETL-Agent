@@ -109,6 +109,7 @@ class LocalSecretProvider:
 
     def put(self, name: str, payload: dict[str, str]) -> str:
         ref = f"local://{name}"
+        # 读—改—写必须处于同一把锁内，否则两个并发轮转会互相覆盖整份凭据表。
         with self._lock:
             data = self._load()
             data[ref] = payload
@@ -252,6 +253,7 @@ class CredentialService:
 
 def _build_provider() -> SecretProvider:
     backend: Any = settings.secret_backend
+    # 后端由部署配置显式选择；未知值直接失败，避免误降级到安全性较低的本地存储。
     if backend == "vault":
         return VaultSecretProvider(
             addr=settings.vault_addr,

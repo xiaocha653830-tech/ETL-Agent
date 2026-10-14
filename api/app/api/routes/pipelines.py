@@ -16,8 +16,8 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import CurrentUser, DbSession, ensure_role, require_project_member
 from app.api.routes.datasources import authorized_datasource
-from app.core.errors import ResourceConflict, ResourceNotFound
-from app.models.datasource import MetadataProfile
+from app.core.errors import AppError, ModelUnavailable, ResourceConflict, ResourceNotFound
+from app.models.datasource import Datasource, MetadataProfile
 from app.models.identity import Membership, User, UserRole
 from app.models.pipeline import PipelineRun, PipelineRunStatus
 from app.models.version import PipelineVersion
@@ -58,13 +58,11 @@ def _latest_profile(db: Session, datasource_id: uuid.UUID) -> MetadataProfile | 
     )
 
 
-def build_endpoint(db: Session, datasource_id: uuid.UUID, user: User) -> EndpointContext:
-    """把数据源及其最新探查结果打包成生成阶段的输入。
+def _to_context(datasource: Datasource, profile: MetadataProfile | None) -> EndpointContext:
+    """把「数据源 + 某次探查」打包成生成阶段的输入。
 
     只取非敏感连接参数与 Schema；**凭据完全不进入本结构**。
     """
-    datasource, _ = authorized_datasource(db, datasource_id, user)
-    profile = _latest_profile(db, datasource.id)
     tables = ((profile.schema_json or {}).get("tables") or []) if profile else []
     return EndpointContext(
         datasource_id=str(datasource.id),
@@ -72,11 +70,53 @@ def build_endpoint(db: Session, datasource_id: uuid.UUID, user: User) -> Endpoin
         type=datasource.type.value,
         config=datasource.config or {},
         tables=tables,
+        profile_id=str(profile.id) if profile else None,
+    )
+
+
+def build_endpoint(db: Session, datasource_id: uuid.UUID, user: User) -> EndpointContext:
+    """按数据源的**最新探查结果**装配上下文（生成阶段入口）。"""
+    datasource, _ = authorized_datasource(db, datasource_id, user)
+    return _to_context(datasource, _latest_profile(db, datasource.id))
+
+
+def build_endpoint_from_profile(
+    db: Session, profile_id: uuid.UUID, user: User
+) -> EndpointContext:
+    """按**指定的探查记录**装配上下文（冻结阶段入口）。
+
+    冻结必须复用生成时绑定的探查版本，不能重新取「最新」——否则两次探查之间的
+    Schema 变化会让门禁结论与生成依据脱节，冻结出来的指纹也就不能代表被审的方案。
+    探查记录或数据源已被删除时抛 :class:`ResourceNotFound`，由调用方决定如何呈现。
+    """
+    profile = db.get(MetadataProfile, profile_id)
+    if profile is None:
+        raise ResourceNotFound("探查记录不存在")
+    datasource, _ = authorized_datasource(db, profile.datasource_id, user)
+    return _to_context(datasource, profile)
+
+
+def _as_profile_id(raw: Any) -> uuid.UUID | None:
+    try:
+        return uuid.UUID(str(raw)) if raw else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _bound_profiles(state: dict[str, Any]) -> tuple[uuid.UUID | None, uuid.UUID | None]:
+    """取回生成阶段绑定的探查记录 id（随 checkpoint 一起持久化）。"""
+    return (
+        _as_profile_id((state.get("source_meta") or {}).get("profile_id")),
+        _as_profile_id((state.get("target_meta") or {}).get("profile_id")),
     )
 
 
 def _maybe_create_draft(
-    db: Session, run: PipelineRun, result: GenerationResult, user: User
+    db: Session,
+    run: PipelineRun,
+    result: GenerationResult,
+    user: User,
+    state: dict[str, Any],
 ) -> None:
     """生成成功后自动落一条草稿版本（T-09 的冻结入口）。
 
@@ -87,6 +127,7 @@ def _maybe_create_draft(
     if db.scalar(select(PipelineVersion).where(PipelineVersion.run_id == run.id)) is not None:
         return
 
+    source_profile_id, target_profile_id = _bound_profiles(state)
     create_draft(
         db,
         project_id=run.project_id,
@@ -95,7 +136,47 @@ def _maybe_create_draft(
         plan=result.plan.model_dump(mode="json"),
         config=result.config.content if result.config else "",
         quality_rules=[rule.model_dump() for rule in result.plan.quality_rules],
+        source_profile_id=source_profile_id,
+        target_profile_id=target_profile_id,
     )
+
+
+def _fail_run(db: Session, run: PipelineRun, exc: Exception) -> None:
+    """把生成阶段的异常收敛成 ``failed`` 终态，再让异常继续向上抛。
+
+    没有这一步，模型超时会让 run 永远停在 ``running``，前端轮询不到任何结果，
+    运维也看不出这条任务是死是活。**错误信息只落受控文案，不落 Prompt 内容**。
+    """
+    if isinstance(exc, AppError):
+        run.error = exc.message
+    else:
+        run.error = "生成流程异常终止（详见服务端日志）"
+        logger.exception("生成流程异常 run=%s", run.id, exc_info=exc)
+    run.status = PipelineRunStatus.FAILED
+    db.commit()
+
+
+def _run_graph(
+    db: Session,
+    run: PipelineRun,
+    user: User,
+    *,
+    state: dict[str, Any] | None = None,
+    resume_value: dict[str, Any] | None = None,
+) -> GenerationResult:
+    """执行状态机 → 落库 → 必要时建草稿；异常一律收敛为 ``failed``。"""
+    try:
+        snapshot = _invoke_graph(run.id, state, resume_value=resume_value)
+    except Exception as exc:  # noqa: BLE001 —— 任何异常都不允许留下 running 悬挂态
+        _fail_run(db, run, exc)
+        if isinstance(exc, AppError):
+            raise
+        raise ModelUnavailable("生成流程异常终止") from exc
+
+    result = _build_result(run, snapshot)
+    _persist(db, run, result)
+    _maybe_create_draft(db, run, result, user, snapshot)
+    return result
 
 
 def _authorized_run(
@@ -273,10 +354,7 @@ def generate(
         source=source,
         target=target,
     )
-    result = _build_result(run, _invoke_graph(run.id, state))
-    _persist(db, run, result)
-    _maybe_create_draft(db, run, result, user)
-    return result
+    return _run_graph(db, run, user, state=state)
 
 
 @router.post("/{run_id}/resume", response_model=GenerationResult)
@@ -296,12 +374,9 @@ def resume(
     if not payload.answers:
         raise ResourceConflict("未提供任何补充信息")
 
-    result = _build_result(
-        run, _invoke_graph(run_id, resume_value={"answers": payload.answers})
+    return _run_graph(
+        db, run, user, resume_value={"answers": payload.answers}
     )
-    _persist(db, run, result)
-    _maybe_create_draft(db, run, result, user)
-    return result
 
 
 @router.get("/{run_id}", response_model=GenerationResult)

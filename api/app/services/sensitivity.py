@@ -200,6 +200,7 @@ def assess_column(column_name: str, samples: Sequence[str] = ()) -> ColumnAssess
     """对单个字段定级：字段名规则优先，其次样本值规则，都不命中则为 L2。"""
     normalized = _normalize(column_name)
 
+    # 字段语义比有限样本更稳定；即使本次采样未碰到敏感值，也不能因此降低等级。
     hit = _keyword_hit(normalized, _L4_KEYWORDS)
     if hit:
         return ColumnAssessment(SensitivityLevel.L4, hit[1], "column_name")
@@ -212,6 +213,7 @@ def assess_column(column_name: str, samples: Sequence[str] = ()) -> ColumnAssess
     if sample_hit:
         return ColumnAssessment(sample_hit[0], sample_hit[1], "sample_value")
 
+    # 未命中时保守归为内部业务数据，而不是默认公开，符合 fail-closed 原则。
     return ColumnAssessment(SensitivityLevel.L2, "业务数据", "default")
 
 

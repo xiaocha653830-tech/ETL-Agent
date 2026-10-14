@@ -139,10 +139,12 @@ class PolicyDecisionPoint:
             subject=subject, tool=tool, environment=environment, artifact=artifact
         )
         for policy in self._policies:
+            # None 表示策略不适用；只有显式 deny 才短路，便于独立策略自由组合。
             outcome = policy.evaluate(request)
             if outcome is not None and not outcome.allow:
                 logger.info("PDP 拒绝：策略=%s 理由=%s", policy.name, outcome.reason)
                 return outcome
+        # 全部策略均未拒绝才放行，最终 allow 由统一决策点给出。
         return Decision.permit()
 
 

@@ -8,6 +8,8 @@ from app.services.gate import (
     CheckStatus,
     check_config_syntax,
     check_operators,
+    check_plan_config_consistency,
+    check_plan_structure,
     check_schema_alignment,
     run_gate,
 )
@@ -196,6 +198,249 @@ def test_empty_steps_fails():
     assert check_operators(_plan(steps=[])).status is CheckStatus.FAILED
 
 
+def test_undeclared_attribute_fails():
+    """注册表是权威清单，模型自造的属性名不得进入配置。"""
+    plan = _plan(
+        steps=[
+            {
+                "step_id": "snk",
+                "operator_id": "seatunnel.sink.Doris",
+                "role": "sink",
+                "attributes": {
+                    "database": "ods",
+                    "table": "orders_wide",
+                    "write_mode": "append",
+                },
+            }
+        ]
+    )
+    result = check_operators(plan)
+    assert result.status is CheckStatus.FAILED
+    assert any("write_mode" in detail for detail in result.details)
+
+
+def test_deprecated_attribute_gets_specific_hint():
+    """已废弃写法要给出可照做的修复指引，而不是一句「不在定义中」。"""
+    plan = _plan(
+        steps=[
+            {
+                "step_id": "snk",
+                "operator_id": "seatunnel.sink.Doris",
+                "role": "sink",
+                "attributes": {
+                    "database": "ods",
+                    "table": "orders_wide",
+                    "table.identifier": "ods.orders_wide",
+                },
+            }
+        ]
+    )
+    result = check_operators(plan)
+    assert result.status is CheckStatus.FAILED
+    assert any(
+        "table.identifier" in detail and "已废弃" in detail for detail in result.details
+    )
+
+
+def test_wrong_value_type_fails():
+    plan = _plan(
+        steps=[
+            {
+                "step_id": "snk",
+                "operator_id": "seatunnel.sink.Doris",
+                "role": "sink",
+                "attributes": {"database": 123, "table": "orders_wide"},
+            }
+        ]
+    )
+    result = check_operators(plan)
+    assert result.status is CheckStatus.FAILED
+    assert any("database" in detail and "字符串" in detail for detail in result.details)
+
+
+def test_boolean_attribute_rejects_integer():
+    """bool 是 int 的子类，门禁必须把它区分开。"""
+    plan = _plan(
+        steps=[
+            {
+                "step_id": "snk",
+                "operator_id": "seatunnel.sink.Doris",
+                "role": "sink",
+                "attributes": {
+                    "database": "ods",
+                    "table": "orders_wide",
+                    "sink.enable-2pc": 1,
+                },
+            }
+        ]
+    )
+    assert check_operators(plan).status is CheckStatus.FAILED
+
+
+def test_enum_value_out_of_range_fails():
+    plan = _plan(
+        steps=[
+            {
+                "step_id": "src",
+                "operator_id": "seatunnel.source.MySQL-CDC",
+                "role": "source",
+                "attributes": {
+                    "base-url": "jdbc:mysql://x:3306",
+                    "table-names": ["demo.orders"],
+                    "startup.mode": "whenever",
+                },
+            }
+        ]
+    )
+    result = check_operators(plan)
+    assert result.status is CheckStatus.FAILED
+    assert any("startup.mode" in detail for detail in result.details)
+
+
+def test_valid_enum_value_passes():
+    plan = _plan(
+        steps=[
+            {
+                "step_id": "src",
+                "operator_id": "seatunnel.source.MySQL-CDC",
+                "role": "source",
+                "attributes": {
+                    "base-url": "jdbc:mysql://x:3306",
+                    "table-names": ["demo.orders"],
+                    "startup.mode": "latest",
+                },
+            }
+        ]
+    )
+    assert check_operators(plan).status is CheckStatus.PASSED
+
+
+def test_injected_attribute_skips_type_check():
+    """注入类属性的值整体被占位符替换，形态无所谓——不该因此拦下方案。"""
+    plan = _plan(
+        steps=[
+            {
+                "step_id": "src",
+                "operator_id": "seatunnel.source.Jdbc",
+                "role": "source",
+                # url 是注入类，故意给个非字符串值
+                "attributes": {
+                    "url": 12345,
+                    "driver": "com.mysql.cj.jdbc.Driver",
+                    "query": "SELECT 1",
+                },
+            }
+        ]
+    )
+    assert check_operators(plan).status is CheckStatus.PASSED
+
+
+# --------------------------------------------------------------------------
+# 方案结构
+# --------------------------------------------------------------------------
+
+
+def test_structure_passes_for_wellformed_plan():
+    result = check_plan_structure(_plan())
+    assert result.status is CheckStatus.PASSED
+
+
+def test_empty_steps_fails_structure():
+    assert check_plan_structure(_plan(steps=[])).status is CheckStatus.FAILED
+
+
+def test_duplicate_step_id_fails():
+    plan = _plan()
+    plan["steps"][1]["step_id"] = "src"
+    result = check_plan_structure(plan)
+    assert result.status is CheckStatus.FAILED
+    assert any("step_id 重复" in detail for detail in result.details)
+
+
+def test_role_mismatch_against_registry_fails():
+    """方案把 sink 算子标成 source —— DAG 与配置会指向完全不同的东西。"""
+    plan = _plan()
+    plan["steps"][1]["role"] = "source"
+    result = check_plan_structure(plan)
+    assert result.status is CheckStatus.FAILED
+    assert any("sink" in detail for detail in result.details)
+
+
+def test_missing_sink_fails_structure():
+    plan = _plan()
+    plan["steps"] = [plan["steps"][0]]
+    result = check_plan_structure(plan)
+    assert result.status is CheckStatus.FAILED
+    assert any("缺少 sink" in detail for detail in result.details)
+
+
+def test_missing_source_fails_structure():
+    plan = _plan()
+    plan["steps"] = [plan["steps"][1]]
+    result = check_plan_structure(plan)
+    assert result.status is CheckStatus.FAILED
+    assert any("缺少 source" in detail for detail in result.details)
+
+
+# --------------------------------------------------------------------------
+# 方案与配置一致
+# --------------------------------------------------------------------------
+
+
+def test_matching_config_passes_consistency():
+    assert (
+        check_plan_config_consistency(_plan(), VALID_CONFIG).status is CheckStatus.PASSED
+    )
+
+
+def test_config_with_different_sink_fails_consistency():
+    """审的是 Doris 方案，跑的是 Clickhouse 配置——这正是 FR-19 要挡住的错配。"""
+    mismatched = """
+env {
+  parallelism = 2
+}
+source {
+  Jdbc {
+    driver = "x"
+    query = "y"
+  }
+}
+sink {
+  Clickhouse {
+    database = "ods"
+  }
+}
+"""
+    result = check_plan_config_consistency(_plan(), mismatched)
+    assert result.status is CheckStatus.FAILED
+    assert any("Doris" in detail and "未出现" in detail for detail in result.details)
+    assert any("Clickhouse" in detail for detail in result.details)
+
+
+def test_config_missing_source_block_fails_consistency():
+    sink_only = """
+env {
+  parallelism = 2
+}
+sink {
+  Doris {
+    database = "ods"
+  }
+}
+"""
+    result = check_plan_config_consistency(_plan(), sink_only)
+    assert result.status is CheckStatus.FAILED
+    assert any("Jdbc" in detail for detail in result.details)
+
+
+def test_unparseable_config_is_skipped_in_consistency():
+    """解析不了就无从比对——语法检查已经会把它判失败，这里不重复计一次。"""
+    assert (
+        check_plan_config_consistency(_plan(), BROKEN_CONFIG).status
+        is CheckStatus.SKIPPED
+    )
+
+
 # --------------------------------------------------------------------------
 # Schema 对齐
 # --------------------------------------------------------------------------
@@ -243,7 +488,7 @@ def test_missing_profile_is_skipped_not_failed():
 def test_gate_passes_when_all_checks_pass():
     report = run_gate(plan=_plan(), config=VALID_CONFIG, source=SOURCE, target=TARGET)
     assert report.passed is True
-    assert report.to_dict()["summary"] == {"passed": 3, "failed": 0, "skipped": 0}
+    assert report.to_dict()["summary"] == {"passed": 5, "failed": 0, "skipped": 0}
 
 
 def test_gate_fails_on_broken_config():

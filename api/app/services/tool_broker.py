@@ -202,7 +202,8 @@ class ToolBroker:
             artifact=claims.artifact,
         )
 
-        # 4) 原子消费（防重放）—— 到此为止令牌只能被放行一次
+        # 4) 原子消费（防重放）—— 必须发生在 handler 之前；即使执行失败也不能重放令牌。
+        # side_effect 只决定是否留痕，不改变“一次授权只允许一次调用”的约束。
         capability = verify_capability(
             db, capability_token, binding, consume=True, signing_key=key
         )
@@ -218,6 +219,7 @@ class ToolBroker:
             return result
         finally:
             if spec.side_effect:
+                # finally 确保失败调用同样留下证据，避免审计记录只呈现成功路径。
                 self._sink.record(
                     ToolInvocation(
                         capability_id=capability.id,

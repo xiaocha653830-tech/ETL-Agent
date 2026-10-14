@@ -52,6 +52,7 @@ def compute_fingerprint(plan: dict[str, Any], config: str, quality_rules: list[A
 
 def next_version_no(db: Session, project_id: uuid.UUID) -> int:
     """项目内递增的版本号（前端展示「v3」）。"""
+    # 版本号仅用于人类阅读；真正的内容身份由冻结后的 sha256 指纹承担。
     current = db.scalar(
         select(func.max(PipelineVersion.version_no)).where(
             PipelineVersion.project_id == project_id
@@ -69,8 +70,13 @@ def create_draft(
     plan: dict[str, Any],
     config: str,
     quality_rules: list[Any] | None = None,
+    source_profile_id: uuid.UUID | None = None,
+    target_profile_id: uuid.UUID | None = None,
 ) -> PipelineVersion:
-    """生成成功后落一条草稿版本；此时尚无指纹（未过门禁）。"""
+    """生成成功后落一条草稿版本；此时尚无指纹（未过门禁）。
+
+    同时绑定本次生成所依据的探查记录，供冻结阶段按同一版本还原 Schema。
+    """
     version = PipelineVersion(
         project_id=project_id,
         run_id=run_id,
@@ -80,6 +86,8 @@ def create_draft(
         etl_plan=plan,
         config=config,
         quality_rules=list(quality_rules or []),
+        source_profile_id=source_profile_id,
+        target_profile_id=target_profile_id,
     )
     db.add(version)
     db.commit()
@@ -100,6 +108,7 @@ def freeze_version(
     version.gate_report = report.to_dict()
 
     if not report.passed:
+        # 先持久化 rejected 与完整报告再抛业务异常，确保失败也能追溯。
         version.status = VersionStatus.REJECTED
         db.commit()
         failed = "；".join(f"{c.name}：{c.message}" for c in report.failed_checks)
@@ -173,6 +182,7 @@ def diff_versions(left: PipelineVersion, right: PipelineVersion) -> dict[str, An
     right_steps = [str(step.get("operator_id")) for step in (right_plan.get("steps") or [])]
 
     config_diff = list(
+        # 统一 diff 直接供审阅界面展示，保留行级上下文而不是只返回 changed=true。
         difflib.unified_diff(
             (left.config or "").splitlines(),
             (right.config or "").splitlines(),

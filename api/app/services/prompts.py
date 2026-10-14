@@ -129,6 +129,7 @@ def build_operator_messages(
     target_context: str,
     clarifications: dict[str, Any] | None = None,
 ) -> list[Message]:
+    # 每次调用都从当前注册表渲染，新增或下线算子后无需同步维护另一份提示词清单。
     system = _OPERATOR_SYSTEM.replace(_MANIFEST_PLACEHOLDER, render_registry_manifest())
 
     lines = [
