@@ -5,13 +5,14 @@
 # 启动：docker compose up -d
 # 连接：mysql -h127.0.0.1 -P8050 -uroot
 #
-# 【关键设计】BE 与 FE 共享网络命名空间（network_mode: service:doris-fe）
-#   原因：Windows Docker Desktop (WSL2) 下，容器 IP 对宿主机不可路由，
-#   而 Doris Stream Load 要求客户端拿到 FE 返回的 BE 地址后【直连 BE】。
-#   共享命名空间后 BE 以 127.0.0.1 上报，FE 与宿主机（经映射端口）都能连上，
-#   宿主机上的 SeaTunnel 因此可以正常写入 Doris。
+# 【为何 BE 用固定容器 IP】曾尝试让 BE 上报 127.0.0.1 以便宿主机直连，
+# 但 Doris 拒绝以回环地址注册 BE（一直 "BE is not register"）。因此维持
+# BE 以真实容器 IP 172.30.80.5 注册。
+# 后果：Windows Docker Desktop (WSL2) 下容器 IP 对宿主机不可路由，
+# 故**数据面 SeaTunnel 必须运行在同一个 Docker 网络内**（不能跑在宿主机），
+# 见 deploy/seatunnel/run-in-docker.sh。
 #
-# 【端口说明】宿主映射须避让 Windows 保留段（实测 8978-9077 含 9030）：
+# 【端口】宿主映射须避让 Windows 保留段（实测 8978-9077 含 9030）：
 #   8030 = FE HTTP      8050 -> 9030 = FE MySQL 协议      8040 = BE HTTP
 # ============================================================
 services:
@@ -20,12 +21,11 @@ services:
     container_name: etl-doris-fe
     hostname: doris-fe
     environment:
-      FE_SERVERS: "fe1:127.0.0.1:9010"
+      FE_SERVERS: "fe1:172.30.80.3:9010"
       FE_ID: "1"
     ports:
       - "8030:8030"   # FE HTTP：Stream Load 提交、元数据 API
       - "8050:9030"   # FE MySQL 协议（宿主 8050）：9030 被 Windows 动态保留
-      - "8040:8040"   # BE HTTP：因 BE 共享本网络命名空间，端口在此映射
     networks:
       doris-net:
         ipv4_address: 172.30.80.3
@@ -42,14 +42,18 @@ services:
   doris-be:
     image: apache/doris:doris-be-2.1.7
     container_name: etl-doris-be
-    # 与 FE 共享网络命名空间：BE 以 127.0.0.1 暴露，FE 与宿主机均可达
-    network_mode: "service:doris-fe"
+    hostname: doris-be
     environment:
-      FE_SERVERS: "fe1:127.0.0.1:9010"
-      BE_ADDR: "127.0.0.1:9050"
+      FE_SERVERS: "fe1:172.30.80.3:9010"
+      BE_ADDR: "172.30.80.5:9050"
     depends_on:
       doris-fe:
         condition: service_healthy
+    ports:
+      - "8040:8040"   # BE HTTP：Stream Load 数据通道（宿主机仅调试用）
+    networks:
+      doris-net:
+        ipv4_address: 172.30.80.5
     volumes:
       - doris-be-storage:/opt/apache-doris/be/storage
       - doris-be-log:/opt/apache-doris/be/log

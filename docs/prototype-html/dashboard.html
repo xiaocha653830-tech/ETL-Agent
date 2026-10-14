@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>总览工作台 · ETL-Agent</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/font-awesome@4.7.0/css/font-awesome.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/ibm-plex-sans/index.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/ibm-plex-mono/index.css">
+<link rel="stylesheet" href="assets/app.css">
+</head>
+<body data-page="dashboard">
+
+<div class="shell">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <div class="main">
+    <header class="topbar" id="topbar"></header>
+
+    <main class="content rise">
+
+      <!-- ===== 指标行 ===== -->
+      <section class="stats">
+        <article class="stat" style="--accent: var(--teal)">
+          <div class="stat__grid"></div>
+          <div class="stat__label"><i class="fa fa-database"></i>数据源连接</div>
+          <div class="stat__value">12</div>
+          <div class="stat__foot">
+            <span class="delta delta--up"><i class="fa fa-arrow-up"></i>2</span>
+            <span>本周新增 · 全部连通性通过</span>
+          </div>
+        </article>
+
+        <article class="stat" style="--accent: var(--blue)">
+          <div class="stat__grid"></div>
+          <div class="stat__label"><i class="fa fa-sitemap"></i>Pipeline 版本</div>
+          <div class="stat__value">8</div>
+          <div class="stat__foot">
+            <span class="badge badge--mute">3 已冻结</span>
+            <span>5 草稿</span>
+          </div>
+        </article>
+
+        <article class="stat" style="--accent: var(--amber)">
+          <div class="stat__grid"></div>
+          <div class="stat__label"><i class="fa fa-clock-o"></i>待我审批</div>
+          <div class="stat__value">3</div>
+          <div class="stat__foot">
+            <span class="badge badge--warn"><i class="fa fa-hourglass-half"></i>1 项 4h 后超时</span>
+          </div>
+        </article>
+
+        <article class="stat" style="--accent: var(--green)">
+          <div class="stat__grid"></div>
+          <div class="stat__label"><i class="fa fa-check-circle-o"></i>运行成功率</div>
+          <div class="stat__value">96<small>%</small></div>
+          <div class="stat__foot">
+            <span class="delta delta--flat">近 7 日 23 次运行</span>
+          </div>
+        </article>
+      </section>
+
+      <!-- ===== 主体两栏 ===== -->
+      <section class="grid-2" style="grid-template-columns: 1.75fr 1fr; margin-top: 24px">
+
+        <!-- 左栏 -->
+        <div class="stack">
+
+          <!-- 待我处理 -->
+          <div class="panel panel--gauge">
+            <div class="panel__head">
+              <div class="panel__title"><i class="fa fa-inbox"></i>待我处理</div>
+              <div class="panel__hint">3 项</div>
+              <div class="panel__tools">
+                <button class="btn btn--ghost btn--sm" data-toast="已全部标记为已读"><i class="fa fa-check"></i>全部已读</button>
+              </div>
+            </div>
+            <div class="panel__body panel__body--flush">
+              <table class="tbl">
+                <thead>
+                  <tr>
+                    <th style="width:78px">编号</th>
+                    <th>事项</th>
+                    <th style="width:132px">状态</th>
+                    <th style="width:96px">时间</th>
+                    <th style="width:96px"></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td class="mono t-hi">PV-0009</td>
+                    <td>
+                      <div class="t-hi t-sm">用户表脱敏同步 → Doris</div>
+                      <div class="t-faint t-xs">安全维度审批 · 申请人 王五</div>
+                    </td>
+                    <td><span class="badge badge--warn"><span class="led led--warn"></span>待安全审批</span></td>
+                    <td class="mono t-dim t-xs">5 小时前</td>
+                    <td><a class="btn btn--primary btn--sm" href="runs.html">去审批</a></td>
+                  </tr>
+                  <tr>
+                    <td class="mono t-hi">PV-0007</td>
+                    <td>
+                      <div class="t-hi t-sm">订单宽表每日增量</div>
+                      <div class="t-faint t-xs">数据维度审批 · 申请人 李明</div>
+                    </td>
+                    <td><span class="badge badge--warn"><span class="led led--warn"></span>待数据审批</span></td>
+                    <td class="mono t-dim t-xs">2 小时前</td>
+                    <td><a class="btn btn--primary btn--sm" href="runs.html">去审批</a></td>
+                  </tr>
+                  <tr>
+                    <td class="mono t-hi">GEN-0042</td>
+                    <td>
+                      <div class="t-hi t-sm">生成任务在澄清点中断</div>
+                      <div class="t-faint t-xs">缺少「主键去重规则」参数</div>
+                    </td>
+                    <td><span class="badge badge--info"><i class="fa fa-pause"></i>澄清中断</span></td>
+                    <td class="mono t-dim t-xs">12 分钟前</td>
+                    <td><a class="btn btn--sm" href="studio.html">继续</a></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- 最近运行 -->
+          <div class="panel">
+            <div class="panel__head">
+              <div class="panel__title"><i class="fa fa-tachometer"></i>最近运行</div>
+              <div class="panel__tools">
+                <a class="btn btn--ghost btn--sm" href="runs.html">查看全部</a>
+              </div>
+            </div>
+            <div class="panel__body panel__body--flush">
+              <table class="tbl">
+                <thead>
+                  <tr>
+                    <th style="width:100px">运行编号</th>
+                    <th>目标表</th>
+                    <th style="width:120px">写入量</th>
+                    <th style="width:132px">预算占用</th>
+                    <th style="width:70px">耗时</th>
+                    <th style="width:80px">结论</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td class="mono t-hi">RUN-1023</td>
+                    <td>
+                      <div class="t-sm t-hi">doris.ods_order_wide</div>
+                      <div class="t-faint t-xs">原子 Swap 已发布</div>
+                    </td>
+                    <td class="num t-hi">1.24M 行</td>
+                    <td>
+                      <div class="segbar" data-value="62" style="width:92px">
+                        <span></span><span></span><span></span><span></span><span></span>
+                        <span></span><span></span><span></span><span></span><span></span>
+                      </div>
+                    </td>
+                    <td class="num t-dim">02:14</td>
+                    <td><span class="badge badge--ok"><i class="fa fa-check"></i>成功</span></td>
+                  </tr>
+                  <tr>
+                    <td class="mono t-hi">RUN-1022</td>
+                    <td>
+                      <div class="t-sm t-hi">doris.dim_user</div>
+                      <div class="t-faint t-xs">拒绝率 22% 触发硬中断</div>
+                    </td>
+                    <td class="num t-hi">318K 行</td>
+                    <td>
+                      <div class="segbar segbar--danger" data-value="100" style="width:92px">
+                        <span></span><span></span><span></span><span></span><span></span>
+                        <span></span><span></span><span></span><span></span><span></span>
+                      </div>
+                    </td>
+                    <td class="num t-dim">00:41</td>
+                    <td><span class="badge badge--danger"><i class="fa fa-bolt"></i>中断</span></td>
+                  </tr>
+                  <tr>
+                    <td class="mono t-hi">RUN-1021</td>
+                    <td>
+                      <div class="t-sm t-hi">doris.ods_order_wide</div>
+                      <div class="t-faint t-xs">原子 Swap 已发布</div>
+                    </td>
+                    <td class="num t-hi">1.19M 行</td>
+                    <td>
+                      <div class="segbar" data-value="58" style="width:92px">
+                        <span></span><span></span><span></span><span></span><span></span>
+                        <span></span><span></span><span></span><span></span><span></span>
+                      </div>
+                    </td>
+                    <td class="num t-dim">02:07</td>
+                    <td><span class="badge badge--ok"><i class="fa fa-check"></i>成功</span></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+        </div>
+
+        <!-- 右栏 -->
+        <div class="stack">
+
+          <!-- 快捷入口 -->
+          <div class="panel">
+            <div class="panel__head">
+              <div class="panel__title"><i class="fa fa-bolt"></i>快捷入口</div>
+            </div>
+            <div class="panel__body">
+              <div class="stack-sm">
+                <a class="btn btn--block" href="studio.html" style="justify-content:flex-start">
+                  <i class="fa fa-magic t-teal"></i>用自然语言新建 Pipeline
+                </a>
+                <button class="btn btn--block" style="justify-content:flex-start" data-toast="打开数据源登记表单">
+                  <i class="fa fa-plug t-teal"></i>登记数据源连接
+                </button>
+                <button class="btn btn--block" style="justify-content:flex-start" data-toast="发起只读元数据探查">
+                  <i class="fa fa-search t-teal"></i>发起元数据探查
+                </button>
+                <a class="btn btn--block" href="governance.html" style="justify-content:flex-start">
+                  <i class="fa fa-flask t-teal"></i>触发 Benchmark 评测
+                </a>
+              </div>
+            </div>
+          </div>
+
+          <!-- 控制面健康 -->
+          <div class="panel">
+            <div class="panel__head">
+              <div class="panel__title"><i class="fa fa-heartbeat"></i>控制面健康</div>
+              <div class="panel__hint">实时</div>
+            </div>
+            <div class="panel__body">
+              <div class="stack-sm">
+                <div class="row row--between t-sm">
+                  <span class="t-dim"><span class="led led--ok"></span> PostgreSQL 16</span>
+                  <span class="mono t-xs t-faint">已连接 · 3ms</span>
+                </div>
+                <div class="row row--between t-sm">
+                  <span class="t-dim"><span class="led led--ok"></span> Redis 7 (Broker)</span>
+                  <span class="mono t-xs t-faint">队列深度 0</span>
+                </div>
+                <div class="row row--between t-sm">
+                  <span class="t-dim"><span class="led led--ok"></span> SeaTunnel Zeta</span>
+                  <span class="mono t-xs t-faint">:8080 · 集群模式</span>
+                </div>
+                <div class="row row--between t-sm">
+                  <span class="t-dim"><span class="led led--ok"></span> Vault KV v2</span>
+                  <span class="mono t-xs t-faint">已解封</span>
+                </div>
+                <div class="row row--between t-sm">
+                  <span class="t-dim"><span class="led led--run"></span> Celery Worker ×2</span>
+                  <span class="mono t-xs t-faint">租约正常</span>
+                </div>
+                <div class="row row--between t-sm">
+                  <span class="t-dim"><span class="led led--ok"></span> 证据账本哈希链</span>
+                  <span class="mono t-xs t-faint">校验通过</span>
+                </div>
+              </div>
+
+              <hr class="divider">
+
+              <div class="row row--between">
+                <div>
+                  <div class="upper">并发执行</div>
+                  <div class="num t-hi t-lg mt-2">1 / 3</div>
+                </div>
+                <div class="segbar" data-value="33" style="width:118px">
+                  <span></span><span></span><span></span><span></span><span></span>
+                  <span></span><span></span><span></span><span></span><span></span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- 提示 -->
+          <div class="note note--warn">
+            <i class="fa fa-exclamation-triangle"></i>
+            <div>
+              <strong class="t-hi">职责分离强制生效</strong><br>
+              你是 <em class="t-amber" style="font-style:normal">PV-0009</em> 的申请人，
+              该版本的<strong>数据审批槽位</strong>已由他人占用，你不可自批。
+            </div>
+          </div>
+
+        </div>
+      </section>
+
+    </main>
+  </div>
+</div>
+
+<script src="assets/app.js"></script>
+</body>
+</html>

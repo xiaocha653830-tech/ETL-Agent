@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pipeline Studio · ETL-Agent</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/font-awesome@4.7.0/css/font-awesome.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/ibm-plex-sans/index.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/ibm-plex-mono/index.css">
+<link rel="stylesheet" href="assets/app.css">
+<style>
+  .studio { display: grid; grid-template-columns: 372px 1fr; gap: 20px; align-items: start; }
+
+  /* ---- 状态机步进条 ---- */
+  .stepper { display: flex; align-items: center; gap: 0; margin-bottom: 20px; }
+  .step { display: flex; align-items: center; gap: 8px; font-size: 11.5px; color: var(--txt-faint); }
+  .step__dot {
+    width: 20px; height: 20px; border-radius: 50%;
+    display: grid; place-items: center; font-size: 9px;
+    border: 1px solid var(--line); background: var(--ink-800); color: var(--txt-faint);
+  }
+  .step--done  { color: var(--txt-dim); }
+  .step--done .step__dot  { border-color: var(--teal-dim); color: var(--teal); background: rgba(45,212,191,.08); }
+  .step--active { color: var(--txt-hi); }
+  .step--active .step__dot { border-color: var(--amber); color: var(--amber); background: rgba(245,185,66,.1); box-shadow: 0 0 12px -3px var(--amber); }
+  .step__line { flex: 1; height: 1px; background: var(--line-soft); margin: 0 10px; min-width: 14px; }
+  .step__line--done { background: var(--teal-dim); }
+
+  /* ---- DAG ---- */
+  .dag { width: 100%; height: auto; display: block; }
+
+  /* ---- 字段映射 diff ---- */
+  .diffrow {
+    display: flex; align-items: center; gap: 10px;
+    padding: 7px 10px; border-radius: var(--r-xs);
+    font-size: 12px;
+    border: 1px solid transparent;
+  }
+  .diffrow + .diffrow { margin-top: 3px; }
+  .diffrow__sign { font-family: var(--font-mono); font-weight: 600; width: 12px; text-align: center; }
+  .diffrow__name { font-family: var(--font-mono); font-size: 11.5px; }
+  .diffrow__meta { margin-left: auto; font-size: 10.5px; font-family: var(--font-mono); }
+  .diffrow--add { background: rgba(74,222,128,.055); border-color: rgba(74,222,128,.16); }
+  .diffrow--add .diffrow__sign, .diffrow--add .diffrow__name { color: var(--green); }
+  .diffrow--add .diffrow__meta { color: rgba(74,222,128,.7); }
+  .diffrow--mod { background: rgba(245,185,66,.055); border-color: rgba(245,185,66,.16); }
+  .diffrow--mod .diffrow__sign, .diffrow--mod .diffrow__name { color: var(--amber); }
+  .diffrow--mod .diffrow__meta { color: rgba(245,185,66,.7); }
+  .diffrow--del { background: rgba(248,113,113,.05); border-color: rgba(248,113,113,.16); }
+  .diffrow--del .diffrow__sign, .diffrow--del .diffrow__name { color: var(--red); text-decoration: line-through; }
+  .diffrow--del .diffrow__meta { color: rgba(248,113,113,.7); }
+
+  /* ---- 脱敏样本 ---- */
+  .masktbl td, .masktbl th { font-family: var(--font-mono); font-size: 11px; }
+  .masktbl .raw { color: var(--red); text-decoration: line-through; opacity: .55; }
+  .masktbl .mask { color: var(--green); }
+
+  /* ---- 算子清单 ---- */
+  .op {
+    display: flex; align-items: center; gap: 10px;
+    padding: 9px 11px; border-radius: var(--r-sm);
+    border: 1px solid var(--line-soft); background: var(--ink-800);
+  }
+  .op + .op { margin-top: 6px; }
+  .op__ico {
+    width: 26px; height: 26px; flex: 0 0 26px; border-radius: var(--r-xs);
+    display: grid; place-items: center; font-size: 11px;
+    background: var(--ink-700); color: var(--teal); border: 1px solid var(--line);
+  }
+  .op__t { font-size: 12.5px; color: var(--txt-hi); font-family: var(--font-mono); }
+  .op__d { font-size: 10.5px; color: var(--txt-faint); }
+
+  @media (max-width: 1240px) { .studio { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body data-page="studio">
+
+<div class="shell">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <div class="main">
+    <header class="topbar" id="topbar"></header>
+
+    <main class="content rise">
+
+      <!-- ===== 状态机步进 ===== -->
+      <div class="stepper">
+        <div class="step step--done"><span class="step__dot"><i class="fa fa-check"></i></span>需求解析</div>
+        <div class="step__line step__line--done"></div>
+        <div class="step step--active"><span class="step__dot"><i class="fa fa-pause"></i></span>澄清补充</div>
+        <div class="step__line"></div>
+        <div class="step"><span class="step__dot">3</span>方案生成</div>
+        <div class="step__line"></div>
+        <div class="step"><span class="step__dot">4</span>门禁校验</div>
+        <div class="step__line"></div>
+        <div class="step"><span class="step__dot">5</span>冻结版本</div>
+      </div>
+
+      <div class="studio">
+
+        <!-- ================= 左：需求输入与澄清 ================= -->
+        <div class="stack">
+
+          <div class="panel">
+            <div class="panel__head">
+              <div class="panel__title"><i class="fa fa-comments-o"></i>需求输入</div>
+              <div class="panel__hint">GEN-0042</div>
+            </div>
+            <div class="panel__body">
+
+              <div class="grid-2 mb-3" style="gap:10px">
+                <div>
+                  <label class="label">源端</label>
+                  <button class="select"><span><i class="fa fa-database t-teal" style="margin-right:7px"></i>MySQL-CDC</span><i class="fa fa-angle-down"></i></button>
+                </div>
+                <div>
+                  <label class="label">目标端</label>
+                  <button class="select"><span><i class="fa fa-cube t-teal" style="margin-right:7px"></i>Doris</span><i class="fa fa-angle-down"></i></button>
+                </div>
+              </div>
+
+              <label class="label">自然语言需求</label>
+              <textarea class="field" rows="5">把订单表和用户表汇总成一张宽表，按天做增量同步到 Doris，金额字段保留两位小数。</textarea>
+
+              <div class="row row--between mt-3">
+                <span class="t-faint t-xs"><i class="fa fa-info-circle"></i> 生成空间受算子注册表约束</span>
+                <button class="btn btn--ghost btn--sm" data-toast="已重新解析需求"><i class="fa fa-refresh"></i>重新解析</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- 澄清中断 -->
+          <div class="panel" style="border-color: rgba(245,185,66,.3)">
+            <div class="panel__head" style="background: rgba(245,185,66,.045)">
+              <div class="panel__title"><i class="fa fa-pause-circle-o" style="color: var(--amber)"></i>状态机 · 澄清中</div>
+              <div class="panel__tools"><span class="badge badge--warn"><span class="led led--warn"></span>已中断</span></div>
+            </div>
+            <div class="panel__body">
+              <div class="note note--warn mb-3">
+                <i class="fa fa-question-circle"></i>
+                <div>
+                  需求缺少关键参数，已在该检查点<strong class="t-hi">中断</strong>。
+                  补充后将<strong class="t-hi">从断点继续</strong>，已完成的解析阶段不会重跑。
+                </div>
+              </div>
+
+              <div class="upper mb-2">待补充 · 1 项</div>
+
+              <div class="op" style="border-color: rgba(245,185,66,.28)">
+                <div class="op__ico" style="color: var(--amber)"><i class="fa fa-key"></i></div>
+                <div class="grow">
+                  <div class="op__t" style="font-family: var(--font-ui)">主键去重规则未指定</div>
+                  <div class="op__d">增量同步需明确唯一键与冲突策略</div>
+                </div>
+              </div>
+
+              <div class="mt-3">
+                <label class="label">补充说明</label>
+                <input class="field" type="text" placeholder="例如：以 order_id 为唯一键，冲突时保留最新 updated_at">
+              </div>
+
+              <div class="row mt-4" style="gap:8px">
+                <button class="btn btn--primary grow" data-toast="已提交补充，从断点继续生成">
+                  <i class="fa fa-paper-plane"></i>填写并继续
+                </button>
+                <button class="btn btn--ghost" data-toast="跳过将导致门禁 Schema 对齐失败">跳过</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- 上下文保持提示 -->
+          <div class="note note--info">
+            <i class="fa fa-history"></i>
+            <div>
+              已完成阶段已<strong class="t-hi">冻结保留</strong>：需求解析（源端/目标端/字段范围）·
+              算子初筛（3 个候选）。恢复时不会重新调用模型解析。
+            </div>
+          </div>
+
+        </div>
+
+        <!-- ================= 右：方案配置与拓扑审查 ================= -->
+        <div class="stack">
+
+          <div class="panel panel--gauge">
+            <div class="panel__head">
+              <div class="panel__title"><i class="fa fa-object-group"></i>方案审查</div>
+              <div class="panel__tools">
+                <div class="tabs" data-tabs>
+                  <button class="tab is-active" data-tab="plan">EtlPlan</button>
+                  <button class="tab" data-tab="config">可执行配置</button>
+                  <button class="tab" data-tab="dag">DAG 拓扑</button>
+                  <button class="tab" data-tab="diff">字段映射</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="panel__body">
+
+              <!-- pane: EtlPlan -->
+              <div data-pane="plan">
+                <div class="row row--between mb-3">
+                  <span class="upper">结构化作业方案 · 算子选择</span>
+                  <span class="badge badge--ok"><i class="fa fa-check"></i>全部命中注册表</span>
+                </div>
+
+                <div class="op">
+                  <div class="op__ico"><i class="fa fa-database"></i></div>
+                  <div class="grow">
+                    <div class="op__t">source.MySQL-CDC</div>
+                    <div class="op__d">表 orders · 增量位点 updated_at</div>
+                  </div>
+                  <span class="badge badge--mute">source</span>
+                </div>
+                <div class="op">
+                  <div class="op__ico"><i class="fa fa-code-fork"></i></div>
+                  <div class="grow">
+                    <div class="op__t">transform.Join</div>
+                    <div class="op__d">orders o JOIN users u ON o.user_id = u.id</div>
+                  </div>
+                  <span class="badge badge--violet">transform</span>
+                </div>
+                <div class="op">
+                  <div class="op__ico"><i class="fa fa-filter"></i></div>
+                  <div class="grow">
+                    <div class="op__t">transform.Filter</div>
+                    <div class="op__d">按天分区过滤 dt = ${bizdate}</div>
+                  </div>
+                  <span class="badge badge--violet">transform</span>
+                </div>
+                <div class="op">
+                  <div class="op__ico"><i class="fa fa-calculator"></i></div>
+                  <div class="grow">
+                    <div class="op__t">transform.Sql</div>
+                    <div class="op__d">amount 保留两位小数 · ROUND(amount, 2)</div>
+                  </div>
+                  <span class="badge badge--violet">transform</span>
+                </div>
+                <div class="op">
+                  <div class="op__ico"><i class="fa fa-cube"></i></div>
+                  <div class="grow">
+                    <div class="op__t">sink.Doris</div>
+                    <div class="op__d">ods_order_wide · Stream Load · 2PC</div>
+                  </div>
+                  <span class="badge badge--mute">sink</span>
+                </div>
+
+                <div class="note note--ok mt-4">
+                  <i class="fa fa-shield"></i>
+                  <div>
+                    全部算子均来自<strong class="t-hi">受管注册表</strong>（P0 范围）。
+                    未出现未注册组件，无幻觉风险。
+                  </div>
+                </div>
+              </div>
+
+              <!-- pane: 配置 -->
+              <div data-pane="config" hidden>
+                <div class="row row--between mb-3">
+                  <span class="upper">SeaTunnel 配置候选 · config.yaml</span>
+                  <button class="btn btn--ghost btn--sm" data-toast="已复制配置到剪贴板"><i class="fa fa-copy"></i>复制</button>
+                </div>
+<div class="code"><span class="c"># 由 M3 需求生成编排器产出 · 待门禁校验</span>
+<span class="k">env</span> {
+  <span class="k">job.mode</span> = <span class="s">"BATCH"</span>
+  <span class="k">job.name</span> = <span class="s">"ods_order_wide_daily"</span>
+}
+
+<span class="k">source</span> {
+  <span class="k">MySQL-CDC</span> {
+    <span class="k">base-url</span>  = <span class="s">"jdbc:mysql://mysql:3306/order_db"</span>
+    <span class="k">username</span>  = <span class="s">"${secret:order_db.user}"</span>
+    <span class="k">password</span>  = <span class="s">"${secret:order_db.pwd}"</span>   <span class="c"># Vault 注入，不落明文</span>
+    <span class="k">table-names</span> = [<span class="s">"order_db.orders"</span>]
+  }
+}
+
+<span class="k">transform</span> {
+  <span class="k">Sql</span> {
+    <span class="k">query</span> = <span class="s">"SELECT o.order_id, u.user_name,</span>
+             <span class="s">ROUND(o.amount, 2) AS amount</span>
+             <span class="s">FROM orders o JOIN users u ON o.user_id = u.id"</span>
+  }
+}
+
+<span class="k">sink</span> {
+  <span class="k">Doris</span> {
+    <span class="k">fenodes</span>        = <span class="s">"doris-fe:8030"</span>
+    <span class="k">database</span>       = <span class="s">"ods"</span>
+    <span class="k">table</span>          = <span class="s">"ods_order_wide"</span>
+    <span class="k">sink.label-prefix</span> = <span class="s">"${run_id}"</span>   <span class="c"># 幂等语义</span>
+    <span class="k">sink.enable-2pc</span>   = <span class="n">true</span>
+  }
+}</div>
+              </div>
+
+              <!-- pane: DAG -->
+              <div data-pane="dag" hidden>
+                <div class="row row--between mb-3">
+                  <span class="upper">DAG 拓扑 · 线性流水</span>
+                  <span class="t-faint t-xs">5 节点 · 0 环</span>
+                </div>
+
+                <svg class="dag" viewBox="0 0 760 120" role="img" aria-label="DAG 拓扑图">
+                  <defs>
+                    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+                      <path d="M0,1 L9,5 L0,9 z" fill="#2dd4bf" opacity="0.75"/>
+                    </marker>
+                  </defs>
+
+                  <!-- 连线 -->
+                  <g stroke="#2dd4bf" stroke-width="1.4" opacity="0.45" marker-end="url(#ah)" fill="none">
+                    <path d="M154,60 H188"/>
+                    <path d="M322,60 H356"/>
+                    <path d="M490,60 H524"/>
+                    <path d="M658,60 H692"/>
+                  </g>
+
+                  <!-- 节点 -->
+                  <g font-family="IBM Plex Mono, monospace" font-size="10.5">
+                    <rect x="18" y="34" width="136" height="52" rx="6" fill="#15212b" stroke="#24384a"/>
+                    <text x="86" y="55" text-anchor="middle" fill="#e6eff6">MySQL-CDC</text>
+                    <text x="86" y="71" text-anchor="middle" fill="#6c8399" font-size="9">orders</text>
+
+                    <rect x="188" y="34" width="134" height="52" rx="6" fill="#15212b" stroke="#24384a"/>
+                    <text x="255" y="55" text-anchor="middle" fill="#e6eff6">Join</text>
+                    <text x="255" y="71" text-anchor="middle" fill="#6c8399" font-size="9">orders × users</text>
+
+                    <rect x="356" y="34" width="134" height="52" rx="6" fill="#15212b" stroke="#24384a"/>
+                    <text x="423" y="55" text-anchor="middle" fill="#e6eff6">Filter</text>
+                    <text x="423" y="71" text-anchor="middle" fill="#6c8399" font-size="9">dt = ${bizdate}</text>
+
+                    <rect x="524" y="34" width="134" height="52" rx="6" fill="#15212b" stroke="#24384a"/>
+                    <text x="591" y="55" text-anchor="middle" fill="#e6eff6">Sql</text>
+                    <text x="591" y="71" text-anchor="middle" fill="#6c8399" font-size="9">ROUND(amount,2)</text>
+
+                    <rect x="692" y="34" width="56" height="52" rx="6" fill="#0f2b28" stroke="#2dd4bf" stroke-opacity="0.5"/>
+                    <text x="720" y="55" text-anchor="middle" fill="#2dd4bf">Doris</text>
+                    <text x="720" y="71" text-anchor="middle" fill="#6c8399" font-size="9">sink</text>
+                  </g>
+                </svg>
+
+                <div class="row mt-3" style="gap:16px">
+                  <span class="t-faint t-xs"><i class="fa fa-circle t-teal" style="font-size:6px"></i> source</span>
+                  <span class="t-faint t-xs"><i class="fa fa-circle" style="font-size:6px;color:var(--violet)"></i> transform</span>
+                  <span class="t-faint t-xs"><i class="fa fa-circle" style="font-size:6px;color:var(--green)"></i> sink</span>
+                  <span class="t-faint t-xs" style="margin-left:auto">执行引擎：SeaTunnel Zeta（集群模式）</span>
+                </div>
+              </div>
+
+              <!-- pane: 字段映射 -->
+              <div data-pane="diff" hidden>
+                <div class="row row--between mb-3">
+                  <span class="upper">字段映射差异 · vs. 上游 Schema Profile</span>
+                  <span class="row" style="gap:10px">
+                    <span class="t-xs t-green">+2 新增</span>
+                    <span class="t-xs t-amber">~1 变更</span>
+                    <span class="t-xs t-red">−1 移除</span>
+                  </span>
+                </div>
+
+                <div class="diffrow diffrow--add">
+                  <span class="diffrow__sign">+</span>
+                  <span class="diffrow__name">order_id</span>
+                  <span class="t-faint t-xs">BIGINT NOT NULL · 主键</span>
+                  <span class="diffrow__meta">新增</span>
+                </div>
+                <div class="diffrow diffrow--add">
+                  <span class="diffrow__sign">+</span>
+                  <span class="diffrow__name">user_name</span>
+                  <span class="t-faint t-xs">VARCHAR(64)</span>
+                  <span class="diffrow__meta">新增</span>
+                </div>
+                <div class="diffrow diffrow--mod">
+                  <span class="diffrow__sign">~</span>
+                  <span class="diffrow__name">amount</span>
+                  <span class="t-faint t-xs">DECIMAL(10,2) → DECIMAL(18,4)</span>
+                  <span class="diffrow__meta">类型变更</span>
+                </div>
+                <div class="diffrow diffrow--del">
+                  <span class="diffrow__sign">−</span>
+                  <span class="diffrow__name">legacy_status</span>
+                  <span class="t-faint t-xs">目标端已弃用</span>
+                  <span class="diffrow__meta">移除</span>
+                </div>
+
+                <hr class="divider">
+
+                <div class="row row--between mb-3">
+                  <span class="upper">脱敏前后对比 · 采样 3 行</span>
+                  <span class="badge badge--ok"><i class="fa fa-eye-slash"></i>无明文暴露</span>
+                </div>
+
+                <table class="tbl masktbl">
+                  <thead>
+                    <tr><th>字段</th><th>原始值</th><th>返回样本</th><th style="width:80px">分级</th></tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <td class="t-dim">user_name</td>
+                      <td class="raw">张伟</td>
+                      <td class="mask">张*</td>
+                      <td><span class="sens sens--l3">L3</span></td>
+                    </tr>
+                    <tr>
+                      <td class="t-dim">phone</td>
+                      <td class="raw">13812345678</td>
+                      <td class="mask">138****5678</td>
+                      <td><span class="sens sens--l3">L3</span></td>
+                    </tr>
+                    <tr>
+                      <td class="t-dim">id_card</td>
+                      <td class="raw">11010119900101XXXX</td>
+                      <td class="mask">110101********XXXX</td>
+                      <td><span class="sens sens--l4">L4</span></td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+
+            </div>
+          </div>
+
+          <!-- 门禁与提交 -->
+          <div class="panel">
+            <div class="panel__head">
+              <div class="panel__title"><i class="fa fa-check-square-o"></i>确定性静态门禁</div>
+              <div class="panel__tools"><span class="badge badge--ok"><i class="fa fa-check"></i>全部通过</span></div>
+            </div>
+            <div class="panel__body">
+              <div class="row" style="gap:20px; flex-wrap:wrap">
+                <span class="row t-sm" style="gap:6px"><i class="fa fa-check-circle t-green"></i>语法校验</span>
+                <span class="row t-sm" style="gap:6px"><i class="fa fa-check-circle t-green"></i>Schema 对齐</span>
+                <span class="row t-sm" style="gap:6px"><i class="fa fa-check-circle t-green"></i>算子注册表命中</span>
+                <span class="row t-sm" style="gap:6px"><i class="fa fa-check-circle t-green"></i>脱敏检查</span>
+              </div>
+
+              <hr class="divider">
+
+              <div class="row row--between" style="flex-wrap:wrap; gap:14px">
+                <div>
+                  <div class="upper">冻结后摘要指纹（SHA256）</div>
+                  <div class="mono t-hi t-sm mt-2">7f3a9c04e1b8d27f…a4c6</div>
+                </div>
+                <div class="row" style="gap:8px">
+                  <button class="btn" data-toast="已冻结为不可变版本 v8"><i class="fa fa-lock"></i>冻结版本</button>
+                  <button class="btn btn--primary" data-toast="已提交审批：数据维度 + 安全维度"><i class="fa fa-paper-plane"></i>提交审批</button>
+                </div>
+              </div>
+
+              <div class="note note--info mt-4">
+                <i class="fa fa-info-circle"></i>
+                <div>
+                  冻结后版本<strong class="t-hi">不可修改</strong>；任何改动将生成新版本号。
+                  提交审批将同时生成 Prepare 准备单（<strong class="t-hi">零外部副作用</strong>）。
+                </div>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </div>
+
+    </main>
+  </div>
+</div>
+
+<script src="assets/app.js"></script>
+</body>
+</html>

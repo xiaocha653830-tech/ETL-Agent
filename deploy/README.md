@@ -40,15 +40,23 @@ mysql -h127.0.0.1 -P8050 -uroot -e "SHOW BACKENDS\G"  # 确认 BE 已注册（Al
 
 ---
 
-## 二、安装 SeaTunnel 连接器（**当前缺失，阻塞 T-15 / T-16**）
+## 二、SeaTunnel 连接器（✅ **已安装**，2026-10-14）
 
-本地 `seatunnel/apache-seatunnel-2.3.13/connectors/` 目前只有 3 个 jar
-（`connector-console`、`connector-fake`、`connector-cdc-base`），
-`config/plugin_config` 也只列了 `connector-fake` 与 `connector-console`。
+**现状**：`seatunnel/apache-seatunnel-2.3.13/connectors/` 已含 5 个 jar——`connector-doris`、`connector-jdbc`、`connector-cdc-base`、`connector-console`、`connector-fake`（均为 2.3.13 版本）；`config/plugin_config` 已同步追加 `connector-doris` 与 `connector-jdbc`。
 
-**Doris Sink 与 MySQL Source 连接器均未安装，示例作业无法运行。** 补装步骤：
+**本项目 P0 场景使用 JDBC 源**（见 `mysql-to-doris.conf` 的 `source { Jdbc { ... } }`），链路为「全量搬运 → 影子表 → 原子 Swap」，不需要 CDC 增量，因此**未安装 `connector-cdc-mysql`**。
 
-1. 编辑 `seatunnel/apache-seatunnel-2.3.13/config/plugin_config`，追加：
+验证：
+
+```bash
+ls seatunnel/apache-seatunnel-2.3.13/connectors/ | grep -E "doris|jdbc"
+# 应输出 connector-doris-2.3.13.jar 与 connector-jdbc-2.3.13.jar
+```
+
+<details>
+<summary>重装 / 升级时参考：连接器安装步骤</summary>
+
+1. 编辑 `seatunnel/apache-seatunnel-2.3.13/config/plugin_config`：
 
    ```
    --seatunnel-connectors--
@@ -68,14 +76,9 @@ mysql -h127.0.0.1 -P8050 -uroot -e "SHOW BACKENDS\G"  # 确认 BE 已注册（Al
    .\bin\install-plugin.ps1         # Windows PowerShell（如无则用 install-plugin.cmd）
    ```
 
-3. 验证：
+3. 验证：`ls connectors/ | grep doris` 应出现 `connector-doris-2.3.13.jar`
 
-   ```bash
-   ls connectors/ | grep doris       # 应出现 connector-doris-2.3.13.jar
-   ls connectors/ | grep jdbc        # 应出现 connector-jdbc-2.3.13.jar
-   ```
-
-未完成此前置项，`mysql-to-doris.conf` 会报找不到插件。
+</details>
 
 ---
 
@@ -152,4 +155,4 @@ FE 返回的是 BE 的**容器 IP**，而宿主机路由不到它 —— 因此*
 | **宿主 → BE 容器 IP `172.30.80.5:8040`** | ❌ 不可达 |
 | 容器 → 容器（FE ↔ BE） | ✅ |
 
-**结论**：数据面组件（SeaTunnel）必须与 Doris **同处一个 Docker 网络**，不能跑在宿主机上。见 `deploy/seatunnel/docker-compose.yml`。
+**结论**：数据面组件（SeaTunnel）必须与 Doris **同处一个 Docker 网络**，不能跑在宿主机上。落地方式见 `deploy/seatunnel/run-in-docker.sh`（以 `--network doris_doris-net` 加入 Doris 所在网络）。

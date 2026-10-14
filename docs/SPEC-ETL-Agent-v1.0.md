@@ -309,6 +309,28 @@ post:
     '503': { description: 数据面不可达, 错误码: SYS_DATAPLANE_UNAVAILABLE }
 ```
 
+**平台基础与支撑接口**（T-01 ~ T-05 实现，不在上表 10 条业务契约内）：
+
+| 编号 | 方法 | 路径 | 说明 | 对应 FR |
+|------|------|------|------|--------|
+| API-P1 | POST | `/api/v1/auth/register` | 注册用户 | FR-44 |
+| API-P2 | POST | `/api/v1/auth/login` | 登录，签发会话令牌 | FR-44 |
+| API-P3 | GET | `/api/v1/auth/me` | 当前用户 | FR-44 |
+| API-P4 | POST | `/api/v1/projects` | 创建项目（创建者自动为 MAKER） | FR-44、FR-45 |
+| API-P5 | GET | `/api/v1/projects` | 列出我参与的项目 | FR-44 |
+| API-P6 | GET | `/api/v1/projects/{project_id}` | 项目详情（须为项目成员） | FR-44 |
+| API-P7 | GET / POST | `/api/v1/projects/{project_id}/members` | 成员列表 / 邀请成员（限 MAKER） | FR-45 |
+| API-P8 | PATCH / DELETE | `/api/v1/projects/{project_id}/members/{membership_id}` | 改角色 / 移除成员（限 MAKER） | FR-45 |
+| API-P9 | GET | `/api/v1/datasources?project_id=` | 数据源列表 | FR-01 |
+| API-P10 | POST | `/api/v1/datasources/{id}/test` | 安全连通性测试（只执行 `SELECT 1`） | FR-04 |
+| API-P11 | GET | `/api/v1/datasources/{id}/profiles` | 探查结果历史留档 | FR-07 |
+| API-P12 | GET | `/api/v1/operators`、`/operators/summary`、`/operators/{id}` | 受管算子清单（M4 注册表） | FR-11、FR-14 |
+
+> **编号约定**：用 `API-P*` 前缀与上表的 10 条契约冻结条目区隔，避免 T-22 前端的契约基线发生漂移。
+> **令牌区分**：本表用的是**登录会话令牌**（HS256 JWT，默认 60 分钟），仅用于接口鉴权；
+> 执行授权用的**单次能力令牌 Capability**（Ed25519、绑定工具/主体/环境/制品、5 分钟有效、仅可消费一次）
+> 是独立机制，见 FR-26 / FR-27 与 T-10。
+
 **错误码体系（段位划分）**：
 
 | 段位 | 含义 | 示例 |
@@ -317,6 +339,15 @@ post:
 | `POL_` | 策略与审批 | `POL_APPROVAL_INCOMPLETE`、`POL_SELF_APPROVAL_DENIED`、`POL_RISK_BLOCKED` |
 | `BIZ_` | 业务规则 | `BIZ_FINGERPRINT_MISMATCH`、`BIZ_OPERATOR_NOT_SUPPORTED`、`BIZ_BUDGET_EXCEEDED` |
 | `SYS_` | 系统与依赖 | `SYS_DATAPLANE_UNAVAILABLE`、`SYS_MODEL_TIMEOUT`、`SYS_LEASE_LOST` |
+
+**统一错误响应体**——所有错误出口（含框架自身抛出的 404 / 405 / 422）都必须是这个结构：
+
+```json
+{"code": "AUTH_TOKEN_INVALID", "message": "令牌无效或已过期", "detail": null}
+```
+
+前端**只按 `code` 分支处理，不得依赖 `message` 文案**。已发布的编码不得复用或改义。
+实现见 `api/app/core/errors.py`。
 
 ## 7. 关键流程时序图
 
@@ -453,6 +484,37 @@ sequenceDiagram
 - **可并行**：T-05 与 T-01~T-04 并行；T-20/T-21 与 T-19 并行；T-22 前端可与后端联调并行启动。
 - **强串行**：T-10（安全内核）是 T-11~T-13 的前置，须优先完成。
 
+### 10.1 实施进度（截至 2026-10-14）
+
+| 任务 | 状态 | 落地位置 |
+|------|------|---------|
+| T-01 工程骨架 | ✅ 完成 | `api/app/core/`、`api/app/models/identity.py`、`api/app/api/routes/{auth,projects}.py`、`api/alembic/` |
+| T-02 凭据服务 | ✅ 完成 | `api/app/services/credentials.py`（Vault KV v2 + 本地 Fernet 降级） |
+| T-03 数据源接入 | ✅ 完成 | `api/app/models/datasource.py`、`api/app/services/datasource.py`、`api/app/api/routes/datasources.py` |
+| T-04 敏感分级 | ✅ 完成 | `api/app/services/sensitivity.py`（附录 C 规则表） |
+| T-05 算子注册表 | ✅ 完成 | `api/app/registry/`（13 个 P0 算子） |
+| T-06 需求生成 | ✅ 完成 | `api/app/services/orchestrator.py`、`prompts.py`、`config_renderer.py`、`api/app/api/routes/pipelines.py` |
+| T-07 澄清中断与恢复 | ✅ 完成 | 同上（`ask_clarification` 节点 + `POST /pipelines/{run_id}/resume`） |
+| T-08 静态门禁 | ✅ 完成 | `api/app/services/gate.py`（语法 / 算子在册 / Schema 对齐） |
+| T-09 版本冻结与 Diff | ✅ 完成 | `api/app/services/versioning.py`、`api/app/api/routes/versions.py` |
+| T-10 安全内核 | ✅ 完成 | `api/app/core/keys.py`、`api/app/services/{capability,tool_broker,pdp}.py` |
+| T-11 ~ T-23 | ⬜ 未开工 | — |
+
+**T-01 的实际落地范围**比任务表描述多两项——统一错误码体系（§6 段位划分）与项目/成员管理（FR-45）。
+二者是后续所有接口的公共地基，放在骨架阶段一次做掉，避免接口变多后再回头改错误契约。
+
+**T-07 与 T-06 合并实现**：LangGraph 的中断与恢复是同一套机制，拆成两个任务会产生
+「状态机骨架」和「断点恢复」两份互相耦合的代码。实际落地为 `states → interrupt → resume` 一条链路。
+
+**测试基线**：168 个用例全部通过，覆盖 T-01 ~ T-10。开发环境按 §4 约定使用
+**内存 SQLite + 替身数据源 + 替身模型**，不依赖 PostgreSQL / Redis / Vault，也不消费大模型额度。
+
+**端到端已验证**：真实 PostgreSQL + LangGraph 断点持久化环境下，
+「生成 → 落草稿版本 → 门禁 → 冻结」链路跑通，冻结产物的 SHA256 指纹可复算。
+
+**仍未闭环**：§11.1 的 V3（DeepSeek API 可用性）尚未实测。当前开发与测试全部走
+`LLM_BACKEND=fake`，真实模型联调前必须先完成 V3 验证。
+
 ## 11. 待明确事项
 
 **本规格原 7 项待明确事项已全部闭环**（Q1、Q4 经本地制品与官方文档查证，Q2、Q6 由项目组拍板，Q3、Q5、Q7 由架构评审定案）。决策痕迹如下：
@@ -473,7 +535,7 @@ sequenceDiagram
 |------|------|------|
 | V1 | Doris 目标库版本与 `REPLACE WITH TABLE` 可用性 | ✅ **已验证**（见下） |
 | V2 | SeaTunnel Doris Sink 参数 | ✅ **已验证**（见下） |
-| V3 | DeepSeek API 可用性（模型名、配额、网络可达） | ⏳ 待验证（T-06 开工前） |
+| V3 | DeepSeek API 可用性（模型名、配额、网络可达） | ⏳ **待验证**——M3 已用 `LLM_BACKEND=fake` 完成开发与测试，接入真实模型前必须实测 |
 
 **V1 结论**：目标库采用 **Apache Doris ≥ 2.0（建议 2.1.x LTS）**。
 
@@ -496,16 +558,21 @@ sequenceDiagram
 
 > **设计呼应**：`sink.label-prefix` 的「按作业全局唯一」要求，与 FR-27 的幂等语义天然吻合——实现时直接用 `run_id` 作前缀即可，无需额外设计。
 
-### 11.2 V2 衍生的开工前置项（**阻塞 T-15 / T-16**）
+### 11.2 V2 衍生的开工前置项（✅ **已解除**，2026-10-14）
 
-本地 `seatunnel/apache-seatunnel-2.3.13/connectors/` **只有 3 个 jar**（`connector-console`、`connector-fake`、`connector-cdc-base`），`config/plugin_config` 仅列 `connector-fake` 与 `connector-console`——**`connector-doris` 与 MySQL 源连接器均未安装**。开工前必须完成：
+本地 `seatunnel/apache-seatunnel-2.3.13/connectors/` 原仅有 3 个 jar，**现已补装完成**，实际清单：
 
-1. 编辑 `config/plugin_config`，追加 `connector-doris`、`connector-jdbc`（或 `connector-cdc-mysql`）
-2. 执行 `bin/install-plugin.sh`（脚本内部调用 `mvnw dependency:get` 从 Maven Central 拉取）
-3. **国内网络须先配置阿里云 Maven 镜像**（改 `mvnw` 使用的 settings），否则下载极慢或失败
-4. 验证：`ls connectors/ | grep doris` 出现 `connector-doris-2.3.13.jar`
+| jar | 用途 |
+|-----|------|
+| `connector-doris-2.3.13.jar` | Doris Sink（影子表写入） |
+| `connector-jdbc-2.3.13.jar` | MySQL / PostgreSQL 等 JDBC 源读取 |
+| `connector-cdc-base-2.3.13.jar` | CDC 公共基座 |
+| `connector-console-2.3.13.jar` | 控制台调试 |
+| `connector-fake-2.3.13.jar` | 造数 |
 
-未完成此前置项，T-15 与 T-16 无法开工。
+`config/plugin_config` 已同步追加 `connector-doris` 与 `connector-jdbc`。**T-15 / T-16 的开工前置项已解除。**
+
+> **实施说明**：本项目 P0 场景（全量搬运 → 影子表 → 原子 Swap）使用 **JDBC 源**即可满足，故未安装 `connector-cdc-mysql`；若后续需要增量 CDC 同步再行补装。环境准备与验证步骤见 `deploy/README.md` 第二节。
 
 ---
 
