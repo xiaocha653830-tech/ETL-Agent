@@ -5,7 +5,7 @@
 5 分钟有效、仅可消费一次），将在 T-10 安全内核中实现（FR-26 / FR-27）。
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import bcrypt
 import jwt
@@ -27,7 +27,7 @@ def verify_password(plain: str, hashed: str) -> bool:
 
 
 def create_access_token(subject: str, extra: dict | None = None) -> str:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     payload: dict = {
         "sub": subject,
         "iat": now,
