@@ -54,6 +54,28 @@ class Settings(BaseSettings):
     llm_backend: Literal["fake", "deepseek"] = "fake"
     llm_timeout_seconds: int = 60
 
+    # ---- 审批与执行预算（M6 / M10，FR-22 / FR-35）----
+    # 审批时限：准备单生成即开始计时，超时后审批不再有效（SPEC §5「expires_at 非空」）
+    approval_ttl_hours: int = 24
+    # 准备单声明的默认执行预算。P0 场景由数据工程师声明的质量契约决定，
+    # 这组值是可配置的兜底；T-17 的运行时监督以此为超预算判据。
+    budget_max_rows: int = 5_000_000
+    budget_max_bytes: int = 2_147_483_648  # 2 GiB
+    budget_max_duration_seconds: int = 1800  # 30 min
+    budget_max_reject_ratio: float = 0.2
+
+    # ---- 异步执行层（M8，FR-28 / FR-29）----
+    # Outbox 投递失败后的指数退避基数与上限（秒）
+    outbox_backoff_base_seconds: int = 5
+    outbox_backoff_max_seconds: int = 300
+    # 单次分发扫描的事件条数上限，避免一次扫描把队列压满
+    outbox_dispatch_batch_size: int = 50
+    # 执行租约时长与心跳间隔（FR-29「Worker 心跳失败不伪造成功」）
+    run_lease_seconds: int = 300
+    run_heartbeat_seconds: int = 30
+    # Outbox 分发任务的触发间隔（Celery beat）
+    outbox_dispatch_interval_seconds: int = 15
+
     @model_validator(mode="after")
     def _validate_secret_key(self) -> "Settings":
         """非开发环境必须使用足够强的会话签名密钥。

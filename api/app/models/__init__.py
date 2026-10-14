@@ -4,6 +4,14 @@
 Alembic autogenerate 与测试建表都依赖这一点。
 """
 
+from app.models.approval import (
+    Approval,
+    ApprovalDecision,
+    ApprovalDimension,
+    Preparation,
+    PreparationStatus,
+    RiskLevel,
+)
 from app.models.capability import Capability
 from app.models.datasource import (
     Datasource,
@@ -11,21 +19,43 @@ from app.models.datasource import (
     DatasourceType,
     MetadataProfile,
 )
+from app.models.execution import (
+    ExecutionRun,
+    ExecutionRunStatus,
+    OutboxEvent,
+    OutboxStatus,
+    RunEvent,
+    RunOperation,
+    RunOperationStatus,
+)
 from app.models.identity import Membership, Project, User, UserRole
 from app.models.pipeline import PipelineRun, PipelineRunStatus
 from app.models.version import PipelineVersion, VersionStatus
 
 __all__ = [
+    "Approval",
+    "ApprovalDecision",
+    "ApprovalDimension",
     "Capability",
     "Datasource",
     "DatasourceStatus",
     "DatasourceType",
+    "ExecutionRun",
+    "ExecutionRunStatus",
     "Membership",
     "MetadataProfile",
+    "OutboxEvent",
+    "OutboxStatus",
     "PipelineRun",
     "PipelineRunStatus",
     "PipelineVersion",
+    "Preparation",
+    "PreparationStatus",
     "Project",
+    "RiskLevel",
+    "RunEvent",
+    "RunOperation",
+    "RunOperationStatus",
     "User",
     "UserRole",
     "VersionStatus",

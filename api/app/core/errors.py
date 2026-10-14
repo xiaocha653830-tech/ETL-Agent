@@ -54,6 +54,8 @@ class ErrorCode(StrEnum):
 
     # ---- POL_：策略与审批（T-10 ~ T-12 逐步填充，此处先占位）----
     POL_SELF_APPROVAL_DENIED = "POL_SELF_APPROVAL_DENIED"
+    # 双维审批未齐（或已超时失效）—— Commit 复核失败的主因（FR-25）
+    POL_APPROVAL_INCOMPLETE = "POL_APPROVAL_INCOMPLETE"
     # PDP（策略决策点）通用拒绝码 —— 不承载业务语义，只表达「准入判定未通过」
     POL_SUBJECT_NOT_AUTHORIZED = "POL_SUBJECT_NOT_AUTHORIZED"
     POL_RISK_BLOCKED = "POL_RISK_BLOCKED"
@@ -62,6 +64,8 @@ class ErrorCode(StrEnum):
     BIZ_VALIDATION_FAILED = "BIZ_VALIDATION_FAILED"
     BIZ_RESOURCE_NOT_FOUND = "BIZ_RESOURCE_NOT_FOUND"
     BIZ_RESOURCE_CONFLICT = "BIZ_RESOURCE_CONFLICT"
+    # Commit 时准备单指纹与版本实际指纹不一致（制品被换过，FR-25）
+    BIZ_FINGERPRINT_MISMATCH = "BIZ_FINGERPRINT_MISMATCH"
     # Tool Broker：请求调用未在 Broker 注册的工具
     BIZ_TOOL_NOT_REGISTERED = "BIZ_TOOL_NOT_REGISTERED"
     # 令牌签名有效，但库中不存在对应签发记录（非本系统签发或记录已清理）
@@ -78,6 +82,10 @@ class ErrorCode(StrEnum):
     SYS_MODEL_UNAVAILABLE = "SYS_MODEL_UNAVAILABLE"
     SYS_MODEL_TIMEOUT = "SYS_MODEL_TIMEOUT"
     SYS_MODEL_OUTPUT_INVALID = "SYS_MODEL_OUTPUT_INVALID"
+    # 数据面引擎不可达或未接通（M9 适配器）
+    SYS_DATAPLANE_UNAVAILABLE = "SYS_DATAPLANE_UNAVAILABLE"
+    # 运行已失去租约（旧 Worker 试图写回终态，或租约被回收）
+    SYS_LEASE_LOST = "SYS_LEASE_LOST"
 
 
 class AppError(Exception):
@@ -160,6 +168,18 @@ class ResourceConflict(AppError):
     message = "资源冲突"
 
 
+class FingerprintMismatch(AppError):
+    """Commit 时制品指纹与准备单声明的指纹不一致（FR-25）。
+
+    这是「审的是一份方案、跑的是另一份配置」的守卫：只要有一步没对齐，
+    双维审批所背书的对象就不再是即将执行的对象，必须拒绝而不是放行。
+    """
+
+    code = ErrorCode.BIZ_FINGERPRINT_MISMATCH
+    status_code = status.HTTP_409_CONFLICT
+    message = "制品指纹与准备单不一致，拒绝执行"
+
+
 # --------------------------------------------------------------------------
 # SYS_：系统与依赖
 # --------------------------------------------------------------------------
@@ -195,6 +215,26 @@ class DatasourceDriverUnavailable(AppError):
     code = ErrorCode.SYS_DATASOURCE_DRIVER_UNAVAILABLE
     status_code = status.HTTP_501_NOT_IMPLEMENTED
     message = "缺少该类型数据源的驱动"
+
+
+class DataplaneUnavailable(AppError):
+    """数据面引擎不可达或适配器尚未接通（M9）。"""
+
+    code = ErrorCode.SYS_DATAPLANE_UNAVAILABLE
+    status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    message = "数据面引擎不可达"
+
+
+class LeaseLost(AppError):
+    """本次运行已不再持有租约（FR-29 租约 fencing）。
+
+    旧 Worker 在租约过期或被回收后醒来时收到此错——它不能再写回任何终态，
+    否则一次「其实已经被别人接管」的执行会把自己的结论覆盖上去。
+    """
+
+    code = ErrorCode.SYS_LEASE_LOST
+    status_code = status.HTTP_409_CONFLICT
+    message = "运行租约已失效"
 
 
 # --------------------------------------------------------------------------
@@ -291,6 +331,27 @@ class RiskBlocked(AppError):
     code = ErrorCode.POL_RISK_BLOCKED
     status_code = status.HTTP_403_FORBIDDEN
     message = "高风险操作被策略拦截"
+
+
+# --------------------------------------------------------------------------
+# POL_：审批（M6，FR-23 ~ FR-25）
+# --------------------------------------------------------------------------
+
+
+class SelfApprovalDenied(AppError):
+    """职责分离拦截（FR-24）：拦截自批与职责混用。"""
+
+    code = ErrorCode.POL_SELF_APPROVAL_DENIED
+    status_code = status.HTTP_403_FORBIDDEN
+    message = "职责分离：不可审批自己提交的版本"
+
+
+class ApprovalIncomplete(AppError):
+    """双维审批未齐或已失效（FR-23 / FR-25）。"""
+
+    code = ErrorCode.POL_APPROVAL_INCOMPLETE
+    status_code = status.HTTP_403_FORBIDDEN
+    message = "审批未完成，不允许执行"
 
 
 class ToolNotRegistered(AppError):

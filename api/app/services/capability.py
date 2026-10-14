@@ -35,6 +35,7 @@ from app.core.errors import (
     CapabilitySignatureInvalid,
 )
 from app.core.keys import SigningKey, get_signing_key
+from app.db.types import as_utc
 from app.models.capability import CAPABILITY_TTL_SECONDS, Capability
 from app.schemas.capability import (
     BindingContext,
@@ -63,11 +64,6 @@ def _resolve_key(signing_key: SigningKey | None) -> SigningKey:
     return signing_key or get_signing_key()
 
 
-def _as_utc(value: datetime) -> datetime:
-    """统一为带时区的时间 —— SQLite 会把 ``DateTime(timezone=True)`` 读成 naive。"""
-    if value.tzinfo is None:
-        return value.replace(tzinfo=UTC)
-    return value.astimezone(UTC)
 
 
 # --------------------------------------------------------------------------
@@ -79,6 +75,7 @@ def sign_claims(claims: CapabilityClaims, *, signing_key: SigningKey | None = No
     """把载荷序列化为令牌串（私有原语，测试与内部签发共用）。"""
     key = _resolve_key(signing_key)
     header = {"alg": key.algorithm, "typ": "CAP", "kid": key.kid}
+    # 键排序和紧凑分隔符生成唯一规范表示，避免等价载荷产生不同签名输入。
     header_b64 = _b64url_encode(
         json.dumps(header, separators=(",", ":"), sort_keys=True).encode("utf-8")
     )
@@ -184,6 +181,7 @@ def verify_capability(
     capability = db.get(Capability, claims.jti)
     if capability is None:
         raise CapabilityNotFound()
+    # 令牌验签只能证明“由私钥签过”；数据库记录还要证明它确由本控制面正式签发。
     if capability.kid != kid:
         # 库中记录与令牌声明的签名密钥不一致：视为被伪造/篡改
         raise CapabilitySignatureInvalid(detail={"reason": "kid 不一致"})
@@ -194,7 +192,7 @@ def verify_capability(
         capability.bound_artifact,
     ) != (claims.tool, claims.subject, claims.environment, claims.artifact):
         raise CapabilityBindingMismatch(detail={"dimension": ["db"]})
-    if _as_utc(capability.expires_at) < datetime.now(UTC):
+    if as_utc(capability.expires_at) < datetime.now(UTC):
         raise CapabilityExpired()
     if capability.consumed:
         raise CapabilityConsumed()
@@ -220,6 +218,7 @@ def consume_capability(db: Session, capability_id: uuid.UUID) -> Capability:
         .values(consumed=True, consumed_at=func.now())
     )
     if result.rowcount != 1:
+        # 条件更新未命中既可能是不存在，也可能是并发请求已抢先消费；对外统一按重放拒绝。
         db.rollback()
         raise CapabilityConsumed()
     db.commit()
@@ -241,10 +240,15 @@ def issue_capability(
     preparation_id: uuid.UUID | None = None,
     ttl_seconds: int = CAPABILITY_TTL_SECONDS,
     signing_key: SigningKey | None = None,
+    commit: bool = True,
 ) -> CapabilityTokenOut:
     """签发一枚单次能力令牌（FR-26）。
 
     ``ttl_seconds`` 不得超过 5 分钟（SPEC §5）；默认即为 300 秒。
+
+    ``commit=False`` 供需要**与其他业务事实同事务**的调用方使用（T-12 的 Commit
+    要把令牌、运行事实与 Outbox 记录一次提交）；此时提交权归调用方，
+    本函数只 ``flush`` 到事务内并回填主键。
     """
     if not 0 < ttl_seconds <= CAPABILITY_TTL_SECONDS:
         raise ValueError(f"令牌有效期必须在 (0, {CAPABILITY_TTL_SECONDS}] 秒内")
@@ -274,7 +278,10 @@ def issue_capability(
         expires_at=datetime.fromtimestamp(claims.exp, tz=UTC),
     )
     db.add(capability)
-    db.commit()
+    if commit:
+        db.commit()
+    else:
+        db.flush()
     db.refresh(capability)
 
     return CapabilityTokenOut(

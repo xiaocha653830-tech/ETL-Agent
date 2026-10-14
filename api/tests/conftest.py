@@ -4,7 +4,10 @@
 不依赖 PostgreSQL / Redis / Vault，测试不消费真实资源。
 """
 
+import uuid
 from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -18,6 +21,9 @@ from app.db.session import get_db
 from app.main import app
 
 DEFAULT_PASSWORD = "Passw0rd!"
+
+# 「已批准并受理」的制品指纹占位；执行链路测试不关心它从哪来，只关心它处处一致
+ARTIFACT = "a" * 64
 
 
 @pytest.fixture()
@@ -85,3 +91,107 @@ def auth_headers(client: TestClient, register_user):
         return {"Authorization": f"Bearer {resp.json()['access_token']}"}
 
     return _headers
+
+
+@pytest.fixture()
+def execution_world(session_factory: sessionmaker[Session]) -> SimpleNamespace:
+    """一条最小可执行链路：项目 / 版本 / 准备单 / 运行 + 一条待投递事件。
+
+    直接用 ORM 造，不走 HTTP：执行层的测试关注的是认领的并发语义与投递的幂等，
+    再跑一遍「生成 → 冻结 → 审批 → Commit」只会让失败原因更难定位。
+    """
+    from app.models.approval import Preparation, PreparationStatus, RiskLevel
+    from app.models.execution import ExecutionRun, ExecutionRunStatus
+    from app.models.identity import Membership, Project, User, UserRole
+    from app.models.version import PipelineVersion, VersionStatus
+    from app.schemas.execution import ExecutionCommand
+    from app.services.commit import EXECUTION_TOOL
+    from app.services.outbox import (
+        EVENT_RUN_REQUESTED,
+        enqueue,
+        execution_run_key,
+    )
+
+    with session_factory() as db:
+        user = User(email="operator@example.com", hashed_password="x")
+        project = Project(name="集成", tenant_id="default")
+        db.add_all([user, project])
+        db.flush()
+        db.add(
+            Membership(user_id=user.id, project_id=project.id, role=UserRole.OPERATOR)
+        )
+
+        version = PipelineVersion(
+            project_id=project.id,
+            created_by=user.id,
+            version_no=1,
+            status=VersionStatus.FROZEN,
+            sha256=ARTIFACT,
+            etl_plan={"target_table": "orders_wide", "steps": []},
+            config="",
+            quality_rules=[],
+            frozen_at=datetime.now(UTC),
+        )
+        db.add(version)
+        db.flush()
+
+        preparation = Preparation(
+            project_id=project.id,
+            version_id=version.id,
+            created_by=user.id,
+            fingerprint=ARTIFACT,
+            risk_level=RiskLevel.P2,
+            risk_reasons=[],
+            impact_scope={"target_table": "orders_wide", "shadow_table": "orders_wide__shadow_v1"},
+            data_grading={"max_level": "L2"},
+            budget={"max_rows": 1000},
+            rollback_plan={"strategy": "discard-shadow"},
+            status=PreparationStatus.COMMITTED,
+            expires_at=datetime.now(UTC) + timedelta(hours=1),
+        )
+        db.add(preparation)
+        db.flush()
+
+        run = ExecutionRun(
+            project_id=project.id,
+            version_id=version.id,
+            preparation_id=preparation.id,
+            created_by=user.id,
+            status=ExecutionRunStatus.PENDING,
+            environment="dev",
+            artifact=ARTIFACT,
+        )
+        db.add(run)
+        db.flush()
+
+        command = ExecutionCommand(
+            run_id=run.id,
+            version_id=version.id,
+            preparation_id=preparation.id,
+            capability_token="header.payload.signature",
+            capability_id=uuid.uuid4(),
+            tool=EXECUTION_TOOL,
+            subject=str(user.id),
+            environment="dev",
+            artifact=ARTIFACT,
+            target_table="orders_wide",
+            shadow_table="orders_wide__shadow_v1",
+            budget={"max_rows": 1000},
+        )
+        event = enqueue(
+            db,
+            idempotency_key=execution_run_key(run.id),
+            event_type=EVENT_RUN_REQUESTED,
+            payload=command.model_dump(mode="json"),
+        )
+        db.commit()
+
+        return SimpleNamespace(
+            project_id=project.id,
+            user_id=user.id,
+            version_id=version.id,
+            preparation_id=preparation.id,
+            run_id=run.id,
+            event_id=event.id,
+            command=command,
+        )

@@ -498,7 +498,11 @@ sequenceDiagram
 | T-08 静态门禁 | ✅ 完成 | `api/app/services/gate.py`（语法 / 算子在册 / Schema 对齐） |
 | T-09 版本冻结与 Diff | ✅ 完成 | `api/app/services/versioning.py`、`api/app/api/routes/versions.py` |
 | T-10 安全内核 | ✅ 完成 | `api/app/core/keys.py`、`api/app/services/{capability,tool_broker,pdp}.py` |
-| T-11 ~ T-23 | ⬜ 未开工 | — |
+| T-11 准备单与双维审批 | ✅ 完成 | `api/app/models/approval.py`、`api/app/services/approval.py`、`api/app/api/routes/approvals.py` |
+| T-12 Commit 收口 | ✅ 完成 | `api/app/services/commit.py`、`api/app/api/routes/commits.py`、`api/app/models/execution.py`（`execution_runs` / `outbox_events`） |
+| T-13 Outbox 分发与任务认领 | ✅ 完成 | `api/app/services/outbox.py`、`api/app/services/execution.py`、`api/app/worker/`（Celery）、`api/app/api/routes/runs.py` |
+| T-14 租约 fencing 与取消 | ✅ 完成 | `api/app/services/lease.py`、`api/app/services/execution.py`、`run_operations` 幂等台账 |
+| T-15 ~ T-23 | ⬜ 未开工 | — |
 
 **T-01 的实际落地范围**比任务表描述多两项——统一错误码体系（§6 段位划分）与项目/成员管理（FR-45）。
 二者是后续所有接口的公共地基，放在骨架阶段一次做掉，避免接口变多后再回头改错误契约。
@@ -506,14 +510,27 @@ sequenceDiagram
 **T-07 与 T-06 合并实现**：LangGraph 的中断与恢复是同一套机制，拆成两个任务会产生
 「状态机骨架」和「断点恢复」两份互相耦合的代码。实际落地为 `states → interrupt → resume` 一条链路。
 
-**测试基线**：168 个用例全部通过，覆盖 T-01 ~ T-10。开发环境按 §4 约定使用
-**内存 SQLite + 替身数据源 + 替身模型**，不依赖 PostgreSQL / Redis / Vault，也不消费大模型额度。
+**测试基线**：315 个用例全部通过，覆盖 T-01 ~ T-14。开发环境按 §4 约定使用
+**内存 SQLite + 替身数据源 + 替身模型 + 替身数据面**，不依赖 PostgreSQL / Redis / Vault，
+也不消费大模型额度；Celery 应用可导入、Beat 调度表可断言，但不连 broker。
 
 **端到端已验证**：真实 PostgreSQL + LangGraph 断点持久化环境下，
-「生成 → 落草稿版本 → 门禁 → 冻结」链路跑通，冻结产物的 SHA256 指纹可复算。
+「生成 → 落草稿版本 → 门禁 → 冻结 → Prepare → 双维审批 → Commit（签发令牌 + 写 Outbox）」
+链路跑通，冻结产物的 SHA256 指纹可复算；迁移经 `alembic upgrade head` / `downgrade` 往返
+与 `alembic check`（模型与库零差异）验证。
 
-**仍未闭环**：§11.1 的 V3（DeepSeek API 可用性）尚未实测。当前开发与测试全部走
-`LLM_BACKEND=fake`，真实模型联调前必须先完成 V3 验证。
+**M8 的边界（T-15 之前）**：`app/services/execution.py` 只认 `DataPlane` 协议，
+默认实现是 `UnavailableDataPlane`——数据面未接通时运行**明确失败**并落
+`SYS_DATAPLANE_UNAVAILABLE`，而不是空跑成功。T-15 接上 SeaTunnel 适配器后，
+认领、事件、终态写入、幂等台账都不必改动。
+
+**仍未闭环**：
+
+1. §11.1 的 V3（DeepSeek API 可用性）尚未实测。当前开发与测试全部走 `LLM_BACKEND=fake`，
+   真实模型联调前必须先完成 V3 验证。
+2. **数据面未接通**（T-15）：受管执行目前必然以 `SYS_DATAPLANE_UNAVAILABLE` 收敛。
+3. **租约回收未实现**（T-19）：租约过期的运行不会被自动回收重排，须由维护任务补上；
+   fencing 已就位，回收后旧 Worker 的写回会被拒绝。
 
 ## 11. 待明确事项
 

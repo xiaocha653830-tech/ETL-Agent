@@ -14,7 +14,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, String, Uuid, false, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, String, Uuid, false, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -35,9 +35,13 @@ class Capability(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
-    # 签发来源（M6 准备单）；M6 尚未落地，允许为空
+    # 签发来源（M6 准备单）。为空表示「非针对某份准备单签发」——令牌本身
+    # 只认四维绑定，有无来源不影响其有效性，因此这里允许为空而非必填。
     preparation_id: Mapped[uuid.UUID | None] = mapped_column(
-        Uuid(as_uuid=True), nullable=True, index=True
+        Uuid(as_uuid=True),
+        ForeignKey("preparations.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
     )
 
     # ---- 四维绑定（任一不匹配即拒绝，FR-26）----
