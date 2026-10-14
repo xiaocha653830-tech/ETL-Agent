@@ -25,6 +25,11 @@ dependencies = [
     "hvac>=2.1",
     # 大模型（DeepSeek，OpenAI 兼容协议）
     "openai>=1.30",
+    # 编排（M3 需求生成状态机，SPEC §2 技术栈：LangGraph + PostgresSaver）
+    "langgraph>=1.0",
+    "langgraph-checkpoint-postgres>=3.0",
+    # 配置语法门禁（T-08：门禁要真正解析 HOCON，而不是靠正则猜）
+    "pyhocon>=0.3.60",
 ]
 
 [project.optional-dependencies]
@@ -41,6 +46,11 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["app"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
 
 [tool.ruff]
 line-length = 100

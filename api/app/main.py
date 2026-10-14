@@ -8,8 +8,10 @@
 
 from fastapi import FastAPI
 
-from app.api.routes import auth, health
+from app.api.routes import auth, datasources, health, pipelines, projects, versions
 from app.core.config import settings
+from app.core.errors import register_exception_handlers
+from app.registry import router as registry_router
 
 API_V1 = "/api/v1"
 
@@ -19,7 +21,17 @@ app = FastAPI(
     description="生产级 ETL-Agent 数据集成平台 — 控制面 API",
 )
 
+# 全局异常处理器：所有错误出口统一为 {code, message, detail}
+register_exception_handlers(app)
+
 # 健康检查挂在根路径，供容器探针使用
 app.include_router(health.router)
+
 # 业务接口统一 /api/v1 前缀
 app.include_router(auth.router, prefix=API_V1)
+app.include_router(projects.router, prefix=API_V1)
+app.include_router(datasources.router, prefix=API_V1)
+app.include_router(pipelines.router, prefix=API_V1)
+app.include_router(versions.router, prefix=API_V1)
+# M4 算子能力注册表：只读清单，供 M3 生成时约束算子空间（FR-11 / FR-14）
+app.include_router(registry_router, prefix=API_V1)
