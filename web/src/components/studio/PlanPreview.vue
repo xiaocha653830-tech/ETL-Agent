@@ -1,0 +1,13 @@
+<script setup lang="ts">
+import { shallowRef } from 'vue'
+import { Database, ArrowRight, Workflow } from 'lucide-vue-next'
+import type { Generation } from '../../types'
+import StatusBadge from '../shared/StatusBadge.vue'
+import EmptyState from '../shared/EmptyState.vue'
+defineProps<{ generation: Generation }>()
+const tab = shallowRef('plan')
+</script>
+<template>
+  <section class="panel stack"><div class="panel-title"><h2>{{ generation.plan?.name || '执行方案' }}</h2><StatusBadge :status="generation.status" /></div><p v-if="generation.plan?.description" class="muted">{{ generation.plan.description }}</p><div class="tabs"><button :class="{ selected: tab === 'plan' }" @click="tab = 'plan'">方案与字段</button><button :class="{ selected: tab === 'config' }" @click="tab = 'config'">只读配置</button></div><template v-if="tab === 'plan' && generation.plan"><div class="dag" aria-label="作业数据流"><template v-for="(step, index) in generation.plan.steps" :key="step.step_id"><div class="dag-node"><component :is="step.role === 'transform' ? Workflow : Database" :size="22" /><strong>{{ step.operator_id.split('.').at(-1) }}</strong><span>{{ step.role === 'source' ? '读取来源' : step.role === 'sink' ? '写入影子表' : '数据处理' }}</span></div><ArrowRight v-if="index < generation.plan.steps.length - 1" :size="19" class="dag-arrow" /></template></div><div class="table-wrap"><table><thead><tr><th>源字段</th><th>目标字段</th><th>处理</th><th>分级</th></tr></thead><tbody><tr v-for="mapping in generation.plan.field_mappings" :key="mapping.source_field + mapping.target_field"><td>{{ mapping.source_field }}</td><td>{{ mapping.target_field }}</td><td>{{ mapping.transform || '直接映射' }}</td><td>{{ mapping.sensitivity_level || '—' }}</td></tr></tbody></table></div></template><pre v-else-if="tab === 'config' && generation.config" class="code-block">{{ generation.config.content }}</pre><EmptyState v-else title="方案尚未生成" /><div v-if="generation.warnings.length" class="notice"><ul><li v-for="warning in generation.warnings" :key="warning">{{ warning }}</li></ul></div><div v-if="generation.status === 'succeeded'" class="actions spread"><span class="small muted">已生成草稿，尚未冻结或执行。</span><RouterLink to="/versions" class="btn btn-primary">配置版本与质量规则</RouterLink></div></section>
+</template>
+<style scoped>.dag{display:flex;align-items:center;gap:14px;padding:20px;background:var(--canvas);border-radius:6px;overflow:auto}.dag-node{display:flex;flex:1;flex-direction:column;gap:9px;background:#fff;border:1px solid var(--line);border-radius:6px;padding:18px;min-width:140px}.dag-node span{font-size:11px;color:var(--muted)}.dag-arrow{flex-shrink:0}.tabs{margin-bottom:0}.notice ul{padding-left:18px;margin:0}</style>

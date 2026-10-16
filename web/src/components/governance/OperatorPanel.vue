@@ -1,0 +1,15 @@
+<script setup lang="ts">
+import { computed, shallowRef } from 'vue'
+import { api } from '../../api'
+import { useLoad } from '../../composables/useLoad'
+import EmptyState from '../shared/EmptyState.vue'
+import Feedback from '../shared/Feedback.vue'
+/** 只读清单：M4 受管注册表决定了方案能用哪些算子（FR-11 / FR-14），不鉴权。 */
+const list = useLoad(signal => api.operators(signal))
+const selection = shallowRef('')
+const selected = computed(() => list.data.value?.find(item => item.operator_id === selection.value) ?? list.data.value?.[0])
+// 空 key 时 useLoad 不会调用 loader，所以这里可以确信 selected 存在
+const detail = useLoad(signal => api.operator(selected.value!.operator_id, signal), () => selected.value?.operator_id)
+</script>
+<template><div class="stack"><Feedback :error="list.error.value || detail.error.value" /><EmptyState v-if="list.loading.value && !list.data.value" title="加载算子清单" loading /><div v-else-if="list.data.value?.length" class="two-col-left"><section class="panel stack"><h2>可用算子</h2><p class="small muted">方案只能从这个清单里选算子；选不中就要返回「不支持」，不得臆造组件。</p><div class="operator-list"><button v-for="item in list.data.value" :key="item.operator_id" class="operator-item" :class="{ 'selected-row': item.operator_id === selected?.operator_id }" @click="selection = item.operator_id"><strong>{{ item.operator_id }}</strong><span class="sub">{{ item.description }}</span></button></div></section><section class="panel stack"><template v-if="detail.data.value"><div class="panel-title"><h2>{{ detail.data.value.operator_id }}</h2><span class="badge">{{ detail.data.value.type }}</span></div><dl class="kv-list"><div class="kv"><dt>连接器制品</dt><dd class="mono">{{ detail.data.value.connector_artifact }}</dd></div><div class="kv"><dt>SeaTunnel 版本</dt><dd>{{ detail.data.value.seatunnel_version }}</dd></div></dl><div v-if="detail.data.value.dialect_constraints.length"><h3>方言约束</h3><div class="actions"><span v-for="item in detail.data.value.dialect_constraints" :key="item" class="badge">{{ item }}</span></div></div><h3>属性</h3><div class="table-wrap"><table><thead><tr><th>属性</th><th>类型</th><th>必填</th><th>默认值</th><th>说明</th></tr></thead><tbody><tr v-for="attribute in detail.data.value.attributes" :key="attribute.name"><td class="mono">{{ attribute.name }}</td><td>{{ attribute.type }}</td><td>{{ attribute.required ? '是' : '否' }}</td><td class="mono">{{ attribute.default ?? '—' }}</td><td>{{ attribute.description }}</td></tr></tbody></table></div></template><EmptyState v-else title="选择一个算子" description="左侧选择一个算子查看它的属性与方言约束。" /></section></div><EmptyState v-else title="算子清单为空" description="注册表未返回任何算子，请确认后端 M4 注册表已加载。" /></div></template>
+<style scoped>.operator-list{display:flex;flex-direction:column;gap:2px;max-height:560px;overflow:auto}.operator-item{display:flex;flex-direction:column;gap:4px;text-align:left;border:0;background:none;padding:11px 12px;border-radius:6px;font-size:13px}.operator-item:hover{background:#f3f3f3}.operator-item.selected-row{background:#efefef}.operator-item .sub{font-size:11px;color:var(--muted);font-weight:400}</style>
