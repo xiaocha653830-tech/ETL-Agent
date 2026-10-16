@@ -1,13 +1,14 @@
 <script setup lang="ts">
 import { computed, shallowRef } from 'vue'
-import type { Role, Run } from '../../types'
-import { cancelRestriction, rollbackRestriction } from '../../utils/permissions'
+import type { Role, Run, Preparation, RollbackResult } from '../../types'
+import { rollbackRestriction } from '../../utils/permissions'
+import { terminal } from '../../utils/display'
 import ConfirmDialog from '../shared/ConfirmDialog.vue'
-const props = defineProps<{ run: Run; role?: Role; busy: boolean }>()
+const props = defineProps<{ run: Run; role?: Role; busy: boolean; preparation: Preparation | null; result: RollbackResult | null }>()
 const emit = defineEmits<{ cancel: []; rollback: [] }>()
-const confirmation = shallowRef(false)
-const cancelReason = computed(() => cancelRestriction(props.run, props.role))
-const rollbackReason = computed(() => rollbackRestriction(props.run, props.role))
-function confirm() { if (!rollbackReason.value) { confirmation.value = false; emit('rollback') } }
+const confirmation = shallowRef<'cancel' | 'rollback' | null>(null)
+const restriction = computed(() => rollbackRestriction(props.run, props.role))
+const canCancel = computed(() => props.role === 'operator' && !terminal(props.run.status) && !props.run.cancel_requested)
+function confirm() { const operation = confirmation.value; confirmation.value = null; if (operation === 'cancel' && canCancel.value) emit('cancel'); else if (operation === 'rollback' && !restriction.value) emit('rollback') }
 </script>
-<template><div class="stack"><section class="panel stack"><h2>运行操作</h2><template v-if="!cancelReason"><p class="small muted">取消是<strong>请求</strong>而非强杀：执行层会在安全点停下，界面上会先显示「正在停止」。</p><button class="btn" :disabled="busy" @click="emit('cancel')">请求取消</button></template><p v-else class="small muted">{{ cancelReason }}</p></section><section class="panel stack"><h2>清理残留</h2><p class="small muted">{{ rollbackReason || '丢弃未发布的影子表残留。正式表不受影响。' }}</p><button class="btn" :disabled="!!rollbackReason || busy" @click="confirmation = true">清理影子表残留</button><p class="small muted">删哪张表由已批准的准备单决定，不由操作方指定。</p></section><p class="small muted">最终权限以服务端校验为准。</p><ConfirmDialog :open="confirmation" title="清理这次运行的影子表残留？" confirm-label="确认清理" :busy="busy" @close="confirmation = false" @confirm="confirm"><p>影子表及其派生的错误表将被删除并释放存储。正式表保持不变。</p><div class="mono">{{ run.id }}</div><p v-if="rollbackReason">{{ rollbackReason }}</p></ConfirmDialog></div></template>
+<template><section class="stack"><div class="actions"><button v-if="role === 'operator' && !terminal(run.status)" class="btn" :disabled="busy || !canCancel" @click="confirmation = 'cancel'">{{ run.cancel_requested ? '正在停止…' : '请求取消' }}</button><button v-if="role === 'operator' && terminal(run.status)" class="btn btn-danger" :disabled="busy || !!restriction" @click="confirmation = 'rollback'">{{ run.rolled_back_at ? '查看既有清理结果' : '清理未发布残留' }}</button><RouterLink :to="`/versions/${run.version_id}`" class="btn">查看冻结版本</RouterLink></div><p v-if="restriction && terminal(run.status)" class="small muted">{{ restriction }}</p><p v-if="run.cancel_requested && !terminal(run.status)" class="small muted">取消请求已发出；只有运行进入取消终态才显示“已取消”。</p><div v-if="result" class="notice" role="status"><div><strong>{{ result.executed ? '本次清理已执行' : '清理结果' }}</strong><p>{{ result.reason }}</p><p v-if="result.dropped.length" class="mono">{{ result.dropped.join('\n') }}</p></div></div></section><ConfirmDialog :open="confirmation !== null" :title="confirmation === 'cancel' ? '请求停止本次运行？' : '清理本次运行残留？'" :confirm-label="confirmation === 'cancel' ? '确认请求取消' : '确认清理'" :busy="busy" @close="confirmation = null" @confirm="confirm"><template v-if="confirmation === 'cancel'"><p>请求将由持有运行租约的执行层处理。返回运行中状态并不代表取消失败，请等待终态。</p></template><template v-else><p>只清理服务端认定的未发布影子表与错误表，不撤销已生效的发布。</p><div v-if="preparation" class="code-block">{{ preparation.impact_scope.shadow_table }}</div><p class="small muted">表名由准备单绑定，不能手动修改。同一版本已有发布记录时，服务端会拒绝清理，以保护旧正式表。</p></template></ConfirmDialog></template>

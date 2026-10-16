@@ -1,8 +1,10 @@
 import { computed, reactive, readonly } from 'vue'
+import { defineStore, storeToRefs } from 'pinia'
 import { api } from '../api'
 import { ApiError, errorMessage, TOKEN_KEY } from '../api/client'
 import type { Member, Project, User } from '../types'
 
+const useSessionStore = defineStore('session', () => {
 const state = reactive({ token: sessionStorage.getItem(TOKEN_KEY) || '', user: null as User | null, projects: [] as Project[], members: [] as Member[], projectId: sessionStorage.getItem('etl.project') || '', loading: false, error: '' })
 let pendingRestore: Promise<void> | undefined
 let sessionRevision = 0
@@ -63,6 +65,11 @@ function restore() {
 }
 
 window.addEventListener('etl:unauthorized', logout)
+return { state: readonly(state), role, project, login, logout, restore, refresh, selectProject }
+})
+
 export function useSession() {
-  return { state: readonly(state), role, project, login, logout, restore, refresh, selectProject }
+  const store = useSessionStore()
+  const { role, project } = storeToRefs(store)
+  return { state: store.state, role, project, login: store.login, logout: store.logout, restore: store.restore, refresh: store.refresh, selectProject: store.selectProject }
 }

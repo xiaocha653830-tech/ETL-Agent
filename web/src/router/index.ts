@@ -1,5 +1,5 @@
 import { createRouter, createWebHistory } from 'vue-router'
-import { TOKEN_KEY } from '../api/client'
+import { useSession } from '../composables/useSession'
 
 /**
  * 路由表。
@@ -57,8 +57,10 @@ export const router = createRouter({
  * 任何预判都只是提示。真正失效时 `api/client.ts` 会发出 `etl:unauthorized`，
  * 由 `useSession` 统一登出并把人送回这里。
  */
-router.beforeEach((to) => {
-  const token = sessionStorage.getItem(TOKEN_KEY)
+router.beforeEach(async (to) => {
+  const session = useSession()
+  await session.restore()
+  const token = session.state.token
   if (!token && to.path !== '/login') return { path: '/login' }
   if (token && to.path === '/login') return { path: '/dashboard' }
   return true

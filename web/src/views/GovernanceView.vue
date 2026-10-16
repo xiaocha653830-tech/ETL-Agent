@@ -1,17 +1,11 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useRoute } from 'vue-router'
+import { LockKeyhole } from 'lucide-vue-next'
 import PageHeader from '../components/shared/PageHeader.vue'
-import OperatorPanel from '../components/governance/OperatorPanel.vue'
-import MemberPanel from '../components/governance/MemberPanel.vue'
-/**
- * 两个 tab 由 `?tab=` 决定，而不是各自一个路由。
- *
- * 既有入口本来就有两套写法——`/governance?tab=members`（数据源页与总览页链向项目成员）
- * 与裸 `/governance`（Studio 与版本页链向算子能力）。合成一个页面、默认落在算子能力，
- * 两边的入口就都落到对的地方，不必去改那四处链接。
- */
+import OperatorsPanel from '../components/governance/OperatorsPanel.vue'
+import MembersPanel from '../components/governance/MembersPanel.vue'
 const route = useRoute()
-const tab = computed(() => route.query.tab === 'members' ? 'members' : 'capabilities')
+const members = computed(() => route.query.tab === 'members')
 </script>
-<template><PageHeader title="安全治理" description="算子能力决定了能做什么，项目成员决定了谁有权做。" /><nav class="tabs"><RouterLink to="/governance" :class="{ selected: tab === 'capabilities' }">算子能力</RouterLink><RouterLink to="/governance?tab=members" :class="{ selected: tab === 'members' }">项目成员</RouterLink></nav><OperatorPanel v-if="tab === 'capabilities'" /><MemberPanel v-else /></template>
+<template><PageHeader title="安全治理" description="查看项目权限、受管能力与治理功能的开放范围。" /><nav class="tabs"><RouterLink to="/governance" :class="{ selected: !members }">算子能力</RouterLink><RouterLink to="/governance?tab=members" :class="{ selected: members }">成员与角色</RouterLink><button disabled>审计账本 · 待开放</button><button disabled>Benchmark · 待开放</button></nav><div class="two-col"><MembersPanel v-if="members" /><OperatorsPanel v-else /><aside class="panel stack"><LockKeyhole :size="25" /><h2>完整证据账本与评测</h2><p class="muted small">哈希链校验、审计报告导出与 Benchmark 尚未开放。当前可查询准备单、冻结版本与运行事实。</p><button class="btn" disabled>查看审计报告</button><button class="btn" disabled>运行 Benchmark</button><hr class="divider" /><h3>角色各司其职</h3><p class="small muted">工程师生成并冻结方案；两位审批人独立批准；操作员单独提交执行。审计员只读查看。</p><p class="small muted">普通运行日志不能代替防篡改证据。</p></aside></div></template>
