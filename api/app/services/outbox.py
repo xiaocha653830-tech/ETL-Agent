@@ -135,6 +135,31 @@ def pending_events(
     return list(db.scalars(stmt))
 
 
+def find_by_run(db: Session, run_id: uuid.UUID) -> OutboxEvent | None:
+    """按运行取回它的投递事件（维护任务用，T-19）。"""
+    return db.scalar(
+        select(OutboxEvent).where(OutboxEvent.idempotency_key == execution_run_key(run_id))
+    )
+
+
+def requeue(db: Session, event: OutboxEvent, *, now: datetime | None = None) -> None:
+    """把一条已投递事件重新放回待投递队列（T-19 租约回收重排）。
+
+    **不新建事件**：执行任务的幂等键是 ``execution-run:<run_id>``，新建一条同名键的
+    事件会被唯一约束挡下；换一个键则等于向系统声明「同一件事应该发生两次」，而这
+    恰恰是要避免的。重排的正确表达是**把同一个逻辑事件重新置为待投递**。
+
+    ``attempts`` 一并归零：原来的 8 次上限记的是「投递不出去」的历史，而这次回收
+    要处理的是「投出去了但没人接住」，两者不是同一件事。不清零会让一次回收后的
+    首次失败就被判死，把重排变成一次注定失败的复活。
+    """
+    event.status = OutboxStatus.PENDING
+    event.attempts = 0
+    event.available_at = now or datetime.now(UTC)
+    event.dispatched_at = None
+    event.last_error = None
+
+
 def mark_dispatched(db: Session, event: OutboxEvent) -> None:
     event.status = OutboxStatus.DISPATCHED
     event.dispatched_at = datetime.now(UTC)

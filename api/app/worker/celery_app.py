@@ -7,8 +7,9 @@ Redis 既作 broker 也作 backend（SPEC §2 技术栈），与 API 共用同�
 重复触发本身是安全的（认领是原子的、投递是幂等的），但那是在用幂等去兜一个
 本可以避免的重复，白白放大队列压力。
 
-任务名**显式指定**（``outbox.dispatch`` / ``execution.run``）：Beat 的调度表里
-引用的是任务名，隐式名会随模块路径重构而变，而调度表在容器重启后才生效——
+任务名**显式指定**（``outbox.dispatch`` / ``execution.run`` / ``maintenance.sweep``）：
+Beat 的调度表里引用的是任务名，隐式名会随模块路径重构而变，
+而调度表在容器重启后才生效——
 名字一改就变成「定时任务静默不触发」，这类故障不会报错，只会让队列慢慢积压。
 """
 
@@ -18,6 +19,8 @@ from app.core.config import settings
 
 TASK_DISPATCH_OUTBOX = "outbox.dispatch"
 TASK_EXECUTION_RUN = "execution.run"
+TASK_MAINTENANCE_SWEEP = "maintenance.sweep"
+TASK_AUDIT_VERIFY = "audit.verify"
 
 celery_app = Celery(
     "etl_agent",
@@ -42,6 +45,20 @@ celery_app.conf.update(
         "dispatch-outbox": {
             "task": TASK_DISPATCH_OUTBOX,
             "schedule": float(settings.outbox_dispatch_interval_seconds),
-        }
+        },
+        # 维护扫描（T-19）：回收卡住的运行。周期比投递长，因为它处理的是
+        # 「已经等了一会儿还是没动静」的情形，扫得太勤只是在重复确认同一批
+        # 尚未到期的租约。
+        "maintenance-sweep": {
+            "task": TASK_MAINTENANCE_SWEEP,
+            "schedule": float(settings.maintenance_sweep_interval_seconds),
+        },
+        # 证据链巡检（T-20，SPEC §8「启动时与定期巡检」的后者）。间隔与签名
+        # 检查点的时间窗口同量级：巡检要能覆盖住「上一个锚点窗口」，否则一条
+        # 刚刚被改过的尾部在被发现前始终看着是干净的。
+        "audit-verify": {
+            "task": TASK_AUDIT_VERIFY,
+            "schedule": float(settings.audit_verify_interval_seconds),
+        },
     },
 )

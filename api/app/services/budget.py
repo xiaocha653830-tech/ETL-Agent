@@ -57,7 +57,7 @@ def _readable(value: float) -> str:
     return f"{int(value):,}" if float(value).is_integer() else f"{value:.4f}"
 
 
-def _limit(value: Any) -> float | None:
+def declared_limit(value: Any) -> float | None:
     """把预算项解析成可比的上限；无法解析的一律视为「未声明」。
 
     布尔值必须被显式排除：``True`` 在 Python 里就是 ``1``，一个误填的
@@ -143,7 +143,7 @@ def evaluate(budget: dict[str, Any] | None, usage: BudgetUsage) -> BudgetVerdict
 
     breaches: list[BudgetBreach] = []
     for dimension, observed in candidates:
-        limit = _limit(declared.get(dimension))
+        limit = declared_limit(declared.get(dimension))
         if limit is None or observed is None:
             continue
         if observed > limit:

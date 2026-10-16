@@ -116,13 +116,14 @@ T-15 控制面使用 **Zeta 集群模式 + REST V2**，启动与接入方法见�
 
 ## 六、Windows 环境适配记录
 
-本机为 **Windows 11 + Docker Desktop (WSL2)**，部署中踩到 5 个平台特有坑，均已解决，记录备查：
+本机为 **Windows 11 + Docker Desktop (WSL2)**，部署中踩到 5 个平台特有坑，均已绕过，
+其中第 3 项的 `vm.max_map_count` **持久化仍未落地**（每次 WSL 重启后需手动重新应用，见表格）：
 
 | # | 现象 | 根因 | 解决 |
 |---|------|------|------|
 | 1 | `docker compose` 建网络报 `Pool overlaps` | 自定义子网 `172.20.80.0/24` 落在已有 `etl-agent_default`（`172.20.0.0/16`）内 | Doris 子网改用 `172.30.80.0/24` |
 | 2 | FE 端口 9030 绑定失败 `forbidden by access permissions` | **Windows 保留端口段 `8978-9077` 罩住 9030** | 宿主映射改为 **8050**（`8050:9030`）；集群内部仍用 9030，不受影响 |
-| 3 | BE 容器 `Exited (0)` | entrypoint 校验 `vm.max_map_count` 与 swap，二者不满足即主动退出 | ① WSL2 各发行版**共享内核**，在 Ubuntu 里 `sysctl -w vm.max_map_count=2000000`；② `swapoff -a` |
+| 3 | BE 容器 `Exited (0)` | entrypoint 校验 `vm.max_map_count` 与 swap，二者不满足即主动退出 | ① **swap**：`.wslconfig` 设 `swap=0`，已验证 WSL 重启后仍生效。不要用 `vm.swappiness=0` 代替——BE 校验的是 `swapon -s` 是否存在交换设备，该参数不改变设备列表；② **`vm.max_map_count`**：`sudo sysctl -p /etc/sysctl.d/99-etl-doris.conf` 当次生效，但 **WSL 重启后回退到 262144**，持久化方案（`/etc/wsl.conf` 的 `[boot] command`）尚未落地 |
 | 4 | 9010 等端口也被拒 | 除静态保留段外，winnat 还会**动态保留**端口 | 内部通信端口（9010/9050/9060）不再暴露到宿主 |
 | 5 | **宿主无法访问容器 IP `172.30.80.5`** | WSL2 网络隔离，容器 IP 对宿主机不可路由 | **见下方说明** |
 
@@ -158,8 +159,79 @@ Worker 的 `.env` 设 `DATA_PLANE_BACKEND=seatunnel`。Worker 在宿主机运行
 `etl-doris-fe:8030`。本适配器只提交到准备单指定的影子表，T-16 才负责质量校验与发布。
 非 `dev`/`demo` 环境须将 SeaTunnel REST 配为 HTTPS；提交请求体包含运行时注入的凭据。
 API 与 Worker 还须共用同一凭据后端：使用 Vault，或共享 `LOCAL_SECRET_FILE` 指向的加密文件。
-T-16 前 `rejected_rows=0` 只是接口占位值，不代表数据质量校验通过。
+运行表上的 `rejected_rows` 在发布路径上由质量报告实测值写回（`report.rejected_rows`）；
+引擎自身不统计质量分流结果，**未启用质量规则时该列仍是 0 占位**，不能据此认为质量校验通过。
 早期冻结版本若没有 `${TARGET_TABLE}` 与 `etl-${RUN_ID}` 运行时占位符，必须重新生成、
 冻结并审批；适配器会拒绝可能直写正式表的旧配置，不会修改已冻结版本。
 
-当前测试使用假 REST 传输；真实 Zeta + MySQL + Doris 的控制面端到端联调尚待执行。
+**2026-10-16 已用真实 Zeta + MySQL + Doris 完成控制面端到端联调**，操作记录见下一节。
+
+## 八、受管链路端到端复跑（2026-10-16 实测）
+
+一次完整跑通所需的全部步骤，命令均在仓库根目录执行。
+
+### 1. 起容器
+
+```bash
+docker compose up -d                                      # PostgreSQL / Redis / Vault
+docker compose -f deploy/mysql/docker-compose.yml up -d   # 演示源库（宿主 3307）
+docker compose -f deploy/doris/docker-compose.yml up -d   # Doris FE + BE
+docker compose -f deploy/seatunnel-zeta.compose.yml up -d
+```
+
+Doris BE 启动依赖 WSL 的 `vm.max_map_count >= 2000000` 且 `swap = 0`（见第六节第 3 条）。
+确认 BE 已注册：
+
+```bash
+docker exec etl-doris-fe mysql -h127.0.0.1 -P9030 -uroot -e "SHOW BACKENDS\G"   # Alive: true
+```
+
+### 2. 起后端三层
+
+```bash
+cd api
+DATA_PLANE_BACKEND=seatunnel ./.venv/Scripts/python.exe -m uvicorn app.main:app --port 8000
+DATA_PLANE_BACKEND=seatunnel ./.venv/Scripts/python.exe -m celery -A app.worker.celery_app:celery_app worker -l info -P solo
+./.venv/Scripts/python.exe -m celery -A app.worker.celery_app:celery_app beat -l info
+```
+
+**Windows 下 Worker 必须加 `-P solo`**：默认 prefork 池会因 `billiard` 的共享内存在
+Windows 上抛 `PermissionError: [WinError 5]` 并不断重启子进程。
+`DATA_PLANE_BACKEND` 用环境变量注入即可，不必改动 `.env`。
+
+### 3. 准备演示目标表并重新探查
+
+```bash
+docker exec etl-doris-fe mysql -h127.0.0.1 -P9030 -uroot -e \
+  "CREATE TABLE ods.\`<目标表名>\` LIKE ods.ods_order_wide;"
+# 再调 POST /api/v1/datasources/{doris_id}/profile 重新探查该 Doris 数据源
+```
+
+**这一步不能省**：冻结门禁的「Schema 对齐」要求目标表出现在数据源**最新的探查结果**里，
+不建表或不重新探查，冻结一定返回 409。影子表不用建——控制面运行时用
+`CREATE TABLE ... LIKE` 自行创建。
+
+### 4. 跑受管链路
+
+```bash
+cd api
+./.venv/Scripts/python.exe -m app.scripts.run_demo_managed_flow \
+  <source_id> <target_id> <目标表名>
+```
+
+脚本走公开 API 完成：提交质量规则 → 冻结 → Prepare → 双维审批 → Commit → 等执行
+→ 打印质量报告。预期结果：源端 8 行 → 正式表 7 行 / 错误表 1 行，且正式表不含「吴十」。
+
+### 5. 两个必须知道的坑
+
+**① 质量规则里的中文不能经命令行传递。**
+2026-10-15 那次演示声明的 `^[^吴].*$` 经 Windows GBK 转换后落库成 `^[^?].*$`
+（10 字节 → 8 字节），正则对象从「吴」变成「问号」，8 行源数据全部通过、分流从未发生，
+而运行状态仍是 `succeeded`。**两份契约都是合法正则**，控制面无从报错，只能靠提交后
+回读比对发现。规则必须写在 Python 源文件里由 JSON 层编码，`run_demo_managed_flow.py`
+已内置该检查。
+
+**② 演示目标表必须是独立的演示表。**
+`seed_demo_pipeline.py` 会拒绝非 `ods_order_wide__formal_pipeline_demo_*` 的目标，
+避免演示流程写到正式表。同一目标表一旦已有版本，种子默认不再新建——需要换一个新的
+目标表名（并重复第 3 步），或让既有版本处于「无活跃运行」状态。

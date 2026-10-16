@@ -43,6 +43,8 @@ from app.models.version import PipelineVersion, VersionStatus
 from app.schemas.capability import CapabilityTokenOut
 from app.schemas.execution import ExecutionCommand
 from app.services.approval import ensure_approvals_complete
+from app.services.audit import EVENT_COMMIT_ACCEPTED, record_audit
+from app.services.audit_verifier import assert_ledger_healthy
 from app.services.capability import issue_capability
 from app.services.outbox import EVENT_RUN_REQUESTED, enqueue, execution_run_key
 from app.services.pdp import get_pdp
@@ -121,6 +123,11 @@ def commit_preparation(
     environment: str | None = None,
 ) -> CommitResult:
     """执行 Commit（API-08）。调用方负责角色与租户校验。"""
+    # 授权类动作的前置门槛（FR-39）：证据链不可信时不再签发新的执行授权。
+    # 放在最前面——它要挡住的正是「基于不可信的证据做决定」，所以必须在读审批、
+    # 比指纹之前就问。回滚同理（见 rollback.py）。
+    assert_ledger_healthy(db)
+
     if preparation.status is PreparationStatus.COMMITTED:
         # 不返回既有 run_id 让重复提交「看起来成功」：那会让调用方以为又拿到了一次
         # 授权，而令牌是单次且 5 分钟有效的——静默成功比报错更危险。
@@ -193,6 +200,26 @@ def commit_preparation(
     preparation.status = PreparationStatus.COMMITTED
     preparation.committed_at = datetime.now(UTC)
 
+    # 账本与运行事实、令牌、Outbox **同事务**落定。Commit 是「凭什么放行」这个
+    # 问题的权威答案，它不能比它授权的那次执行晚到，也不能在那次执行回滚之后独存。
+    record_audit(
+        db,
+        event_type=EVENT_COMMIT_ACCEPTED,
+        actor=str(user_id),
+        project_id=version.project_id,
+        run_id=run.id,
+        version_id=version.id,
+        preparation_id=preparation.id,
+        payload={
+            "artifact": artifact,
+            "environment": resolved_env,
+            "capability_id": str(capability.capability_id),
+            "capability_expires_at": capability.expires_at.isoformat(),
+            "target_table": command.target_table,
+            "shadow_table": command.shadow_table,
+            "risk_level": preparation.risk_level.value,
+        },
+    )
     db.commit()
     db.refresh(run)
 

@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 import app.models  # noqa: F401 —— 导入以注册全部 ORM 模型到 Base.metadata
+from app.core.config import settings
 from app.db.base import Base
 from app.db.session import get_db
 from app.main import app
@@ -53,10 +54,18 @@ def client(session_factory: sessionmaker[Session]) -> Iterator[TestClient]:
             db.close()
 
     app.dependency_overrides[get_db] = _override_get_db
+    # 关掉启动期的证据链校验：它走 SessionLocal（真实数据库），而单元测试用的是
+    # 每次新建的内存库——在那里扫一条空链既无意义，又会把每一条用到 TestClient
+    # 的用例都拖去连一次真库。生产默认值仍是 True（SPEC §8 要求校验器启动时跑）。
+    original_verify = settings.audit_verify_on_startup
+    settings.audit_verify_on_startup = False
     # raise_server_exceptions=False：让 500 也走全局处理器，便于断言统一错误体
-    with TestClient(app, raise_server_exceptions=False) as test_client:
-        yield test_client
-    app.dependency_overrides.clear()
+    try:
+        with TestClient(app, raise_server_exceptions=False) as test_client:
+            yield test_client
+    finally:
+        settings.audit_verify_on_startup = original_verify
+        app.dependency_overrides.clear()
 
 
 @pytest.fixture()

@@ -80,7 +80,10 @@ def main() -> None:
                     ExecutionRun.version_id.in_([version.id for version in matching])
                 )
             ))
-            if not runs or any(
+            # 「没有任何运行记录」与「运行全部失败」同等放行：前者意味着这个目标
+            # **从未被执行过**（典型情形是草稿只被门禁拒绝过），不存在重复写入的
+            # 风险。把这种情况一并拒掉，只会让一次门禁失败永久占住一个目标表名。
+            if any(
                 run.status not in (ExecutionRunStatus.FAILED, ExecutionRunStatus.CANCELLED)
                 for run in runs
             ):

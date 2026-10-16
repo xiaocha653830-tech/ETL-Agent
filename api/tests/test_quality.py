@@ -5,10 +5,12 @@ import uuid
 from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 
 from app.core.errors import DataplaneJobFailed, DataplaneProtocolError
 from app.models.datasource import Datasource, DatasourceType
 from app.models.version import PipelineVersion
+from app.schemas.pipeline import QualityRule
 from app.services.quality import DorisPublisher, compile_quality_config, error_table_name
 
 BASE_CONFIG = '''
@@ -88,6 +90,10 @@ class _DorisConnection:
     def __init__(self):
         self.rows = {"orders_wide": 8}
         self.columns = {"orders_wide": [("order_id", "bigint", "NO")]}
+        # 错误表的 validation_errors 原文（T-16 报告用）：表名 -> [(原始值, 行数)]。
+        # **不是** {错误码: 行数}——真实引擎在这一列写下的是 JSON 数组，
+        # 报告要从里面把 error_message 解析出来（见 quality._error_code）。
+        self.error_dist: dict[str, list[tuple[str, int]]] = {}
         self.statements: list[str] = []
 
     def cursor(self):
@@ -117,6 +123,8 @@ class _DorisCursor:
             self.result = [(int(params[1] in self.connection.rows),)]
         elif sql.startswith("SELECT COUNT(*) FROM"):
             self.result = [(self.connection.rows[tables[0]],)]
+        elif sql.startswith("SELECT validation_errors"):
+            self.result = list(self.connection.error_dist.get(tables[0], []))
         elif sql.startswith("SHOW COLUMNS FROM"):
             self.result = self.connection.columns[tables[0]]
         elif sql.startswith("CREATE TABLE") and " LIKE " in sql:
@@ -197,3 +205,65 @@ def test_doris_publisher_blocks_over_budget_before_swap(monkeypatch):
             source_rows=8, budget={"max_reject_ratio": 0.1}, with_quality_rules=True
         )
     assert not any(sql.startswith("ALTER TABLE") for sql in connection.statements)
+
+
+def test_quality_rule_rejects_warn_at_declaration_time():
+    """``warn`` 在**声明那一刻**就被拒，而不是等运行时才发现它执行不了。
+
+    「告警但放行」与 FR-33 的分流契约本身冲突：违规行会留在结果里被发布出去，
+    错误表失去意义。审批人签下的契约必须是能被执行的那一份——版本一旦冻结就
+    改不动了，那时候才发现规则跑不了，代价是一次白跑的审批。
+    """
+    rule = QualityRule(field="user_name", rule="regex", error_code="E001")
+    assert rule.action == "reject"
+
+    with pytest.raises(ValidationError):
+        QualityRule(field="user_name", rule="regex", error_code="E001", action="warn")
+
+
+def test_error_distribution_reads_the_code_out_of_the_engine_payload(monkeypatch):
+    """错误表里存的是引擎写的 JSON 数组，不是错误码本身。
+
+    2026-10-16 在真实 Doris 上实测到的形态是
+    ``[{"error_message":"USER_NAME_REGEX","field_name":"user_name"}]``。
+    把整串 JSON 当作键，报告里的分布就成了一句没人念得出来的话——
+    而「该去改哪条规则」是这个报告里唯一有行动指向的信息。
+    """
+    publisher, connection = _publisher(monkeypatch)
+    publisher.prepare(with_quality_rules=True)
+    connection.rows[publisher.shadow] = 7
+    connection.rows[publisher.errors] = 1
+    connection.error_dist[publisher.errors] = [
+        ('[{"error_message":"USER_NAME_REGEX","field_name":"user_name"}]', 1)
+    ]
+
+    report = publisher.report(
+        source_rows=8, budget={"max_reject_ratio": 0.2}, with_quality_rules=True
+    )
+
+    assert report.error_dist == {"USER_NAME_REGEX": 1}
+
+
+def test_error_distribution_keeps_its_sum_equal_to_rejected_rows(monkeypatch):
+    """分布的各项之和必须等于拒绝行数。
+
+    同一错误码出现在不同字段上要合并；解析不出的原文和空值也不能被悄悄丢掉——
+    后者恰恰说明有一条拒绝没写错误码，那是需要被看见的异常，不是可以四舍五入的噪声。
+    """
+    publisher, connection = _publisher(monkeypatch)
+    publisher.prepare(with_quality_rules=True)
+    connection.rows[publisher.shadow] = 7
+    connection.rows[publisher.errors] = 5
+    connection.error_dist[publisher.errors] = [
+        ('[{"error_message":"E_REGEX","field_name":"a"}]', 2),
+        ('[{"error_message":"E_REGEX","field_name":"b"}]', 1),
+        ("这不是 JSON", 1),
+        ("", 1),
+    ]
+
+    report = publisher.report(
+        source_rows=12, budget={"max_reject_ratio": 0.9}, with_quality_rules=True
+    )
+
+    assert report.error_dist == {"E_REGEX": 3, "这不是 JSON": 1, "(未标注)": 1}
+    assert sum(report.error_dist.values()) == report.rejected_rows

@@ -1,4 +1,4 @@
-"""运行状态查询（API-09，FR-29 / FR-30）。
+"""运行状态查询与受管回滚（API-09 / API-10，FR-29 / FR-30 / FR-38）。
 
 只读接口：前端运行监控页轮询这里拿「跑得怎么样」。
 
@@ -16,8 +16,9 @@ from app.api.deps import CurrentUser, DbSession, ensure_role, require_project_me
 from app.core.errors import ResourceNotFound
 from app.models.execution import ExecutionRun, ExecutionRunStatus
 from app.models.identity import Membership, User, UserRole
-from app.schemas.execution import ExecutionRunOut
+from app.schemas.execution import ExecutionRunOut, RollbackResultOut
 from app.services.execution import request_cancel
+from app.services.rollback import rollback_run
 
 router = APIRouter(prefix="/runs", tags=["runs"])
 
@@ -66,3 +67,22 @@ def cancel_run(run_id: uuid.UUID, user: CurrentUser, db: DbSession) -> Execution
     ensure_role(membership, UserRole.OPERATOR)
 
     return request_cancel(db, run=run, user_id=user.id)
+
+
+@router.post("/{run_id}/rollback", response_model=RollbackResultOut)
+def rollback(
+    run_id: uuid.UUID, user: CurrentUser, db: DbSession
+) -> RollbackResultOut:
+    """API-10：受管回滚，清理未发布的影子表残留（FR-38 / US-11）。
+
+    请求体是空的，这是刻意的：删哪张表由已批准的准备单决定，不由调用方决定。
+    本接口能表达的唯一诉求是「把这次运行的残留收拾掉」，而它是否适用、
+    具体删什么，都由服务端从冻结版本出发自行判定。
+
+    与取消一样需要 ``OPERATOR`` 以上角色（PRD 第 2 章：系统操作员负责
+    「执行任务暂停/取消/回滚」，且**不可修改 Pipeline 内容、不可审批**）。
+    """
+    run, membership = _authorized_run(db, run_id, user)
+    ensure_role(membership, UserRole.OPERATOR)
+
+    return rollback_run(db, run=run, actor=str(user.id))

@@ -116,3 +116,38 @@ def fenced_update(
         db.rollback()
         return False
     return True
+
+
+def reclaim_lease(
+    db: Session,
+    *,
+    run_id: uuid.UUID,
+    observed_expiry: datetime | None,
+    values: dict,
+) -> bool:
+    """按「租约没有被续过」为守卫回收一次运行（T-19 维护回收）。
+
+    维护任务没有 ``worker_id``——执行方失联正是它要处理的情形，认持有者这条路
+    从一开始就走不通。它只能认那个**可观察且对方一定会改变的量**：读到的到期时刻。
+    原持有者只要还活着就必须续期（长作业续不上租约等于自杀），一续期这个条件
+    就不成立，回收自动让位；反之说明它确实失联了，条件成立，回收生效。
+
+    这与 :func:`fenced_update` 是同一种纪律的两个侧面：**守卫必须建立在对方一定
+    会改变的量上**，而不是建立在「我刚读过，所以现在还是这样」的假设上。
+
+    命中时**不自作主张提交**，提交权同样归调用方——回收结果要与事件落库一起落定。
+    """
+    stmt = update(ExecutionRun).where(
+        ExecutionRun.id == run_id,
+        ExecutionRun.status == ExecutionRunStatus.RUNNING,
+    )
+    stmt = (
+        stmt.where(ExecutionRun.lease_expires_at.is_(None))
+        if observed_expiry is None
+        else stmt.where(ExecutionRun.lease_expires_at == observed_expiry)
+    )
+    result = db.execute(stmt.values(**values))
+    if result.rowcount != 1:
+        db.rollback()
+        return False
+    return True

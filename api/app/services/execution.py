@@ -44,7 +44,17 @@ from app.models.execution import (
     RunOperation,
     RunOperationStatus,
 )
+from app.models.quality import QualityReport
 from app.schemas.execution import ExecutionCommand
+from app.services.audit import (
+    EVENT_EXECUTION_CANCEL_REQUESTED,
+    EVENT_EXECUTION_CANCELLED,
+    EVENT_EXECUTION_CLAIMED,
+    EVENT_EXECUTION_QUALITY_REPORT,
+    EVENT_EXECUTION_SUBMITTED,
+    EXECUTION_TERMINAL_PREFIX,
+    record_audit,
+)
 from app.services.lease import fenced_update, renew_lease
 from app.services.outbox import execution_run_key
 from app.services.redaction import redact_snapshot
@@ -60,6 +70,11 @@ EVENT_CANCELLED = "run.cancelled"
 EVENT_CANCEL_REQUESTED = "run.cancel_requested"
 EVENT_PROGRESS = "run.progress"
 EVENT_BUDGET_EXCEEDED = "run.budget_exceeded"
+EVENT_ROLLED_BACK = "run.rolled_back"
+# 维护回收（T-19）：这两条事件的共同点是**没有 Worker 参与**——写下它们的是
+# 维护任务，而它之所以要写下它们，恰恰因为原本该写终态的那个人已经不在了。
+EVENT_RECLAIMED = "run.reclaimed"  # 租约过期被回收（重排或收敛）
+EVENT_ABANDONED = "run.abandoned"  # 投递不可能到达，运行静默搁浅
 
 # 幂等台账的键：向数据面提交作业
 OPERATION_SUBMIT_JOB = "data-plane.submit-job"
@@ -167,11 +182,17 @@ def load_command(db: Session, run_id: uuid.UUID) -> ExecutionCommand:
 
 @dataclass(frozen=True)
 class ExecutionOutcome:
-    """一次执行的数据面回执（FR-30 状态与度量回传）。"""
+    """一次执行的数据面回执（FR-30 状态与度量回传）。
+
+    ``published`` 由适配器在**确认换表成功之后**置位：只有真正执行了发布的那条
+    路径才知道它发生了，控制面推断不出来（提交成功不等于换表成功）。运行表凭它
+    落 ``published_at``，受管回滚凭它判断影子表名下现在躺着的是谁的数据。
+    """
 
     read_rows: int = 0
     written_bytes: int = 0
     rejected_rows: int = 0
+    published: bool = False
     detail: dict[str, Any] | None = None
 
 
@@ -323,6 +344,7 @@ def _as_projection(outcome: ExecutionOutcome) -> dict[str, Any]:
         "read_rows": outcome.read_rows,
         "written_bytes": outcome.written_bytes,
         "rejected_rows": outcome.rejected_rows,
+        "published": outcome.published,
         "detail": outcome.detail,
     }
 
@@ -332,6 +354,7 @@ def _from_projection(payload: dict[str, Any]) -> ExecutionOutcome:
         read_rows=int(payload.get("read_rows") or 0),
         written_bytes=int(payload.get("written_bytes") or 0),
         rejected_rows=int(payload.get("rejected_rows") or 0),
+        published=bool(payload.get("published")),
         detail=payload.get("detail"),
     )
 
@@ -365,6 +388,26 @@ def _finish(
         raise LeaseLost("写回终态被拒绝：本 Worker 已不是该运行的租约持有者")
 
     db.refresh(run)
+    # 账本先写、事件后写——``record_event`` 会提交，账本因此与终态在同一次落定里。
+    # 三种终态（成功 / 失败 / 取消）都经过这里，所以接在这一处即可全覆盖。
+    record_audit(
+        db,
+        event_type=f"{EXECUTION_TERMINAL_PREFIX}{run.status.value}",
+        actor=f"worker:{worker_id}",
+        project_id=run.project_id,
+        run_id=run.id,
+        version_id=run.version_id,
+        preparation_id=run.preparation_id,
+        payload={
+            "status": run.status.value,
+            "message": message,
+            "error": run.error,
+            "published": run.published_at is not None,
+            "read_rows": run.read_rows,
+            "written_bytes": run.written_bytes,
+            "rejected_rows": run.rejected_rows,
+        },
+    )
     record_event(db, run, event_type, message=message)
     return run
 
@@ -377,13 +420,38 @@ def mark_succeeded(
         run,
         worker_id=worker_id,
         event_type=EVENT_SUCCEEDED,
-        message="执行完成",
+        # 「跑完了」与「换表了」是两件事：命令的结果必须自己说出来，
+        # 否则审计只能靠 status==succeeded 去推断发布发生，而那不是它的含义。
+        message="执行完成，正式表已替换" if outcome.published else "执行完成",
         status=ExecutionRunStatus.SUCCEEDED,
         error=None,
         read_rows=outcome.read_rows,
         written_bytes=outcome.written_bytes,
         rejected_rows=outcome.rejected_rows,
+        published_at=datetime.now(UTC) if outcome.published else None,
     )
+    # 质量结论的**摘要**入链（FR-33 / FR-40）：报告本身落在 quality_reports 表，
+    # 那是一张可写的表；把它的关键数字与指纹摘要写进不可改的账本，目的是让
+    # 「报告表被改过」这件事有对照物。放在 record_quality_report 之前，好让它
+    # 那一次提交把两者一起落定。
+    quality = (outcome.detail or {}).get("quality_report")
+    if quality:
+        record_audit(
+            db,
+            event_type=EVENT_EXECUTION_QUALITY_REPORT,
+            actor=f"worker:{worker_id}",
+            project_id=finished.project_id,
+            run_id=finished.id,
+            payload={
+                "source_rows": quality.get("source_rows"),
+                "valid_rows": quality.get("accepted_rows"),
+                "rejected_rows": quality.get("rejected_rows"),
+                "rejected_ratio": quality.get("rejected_ratio"),
+                "error_dist": quality.get("error_dist"),
+                "error_table": quality.get("error_table"),
+            },
+        )
+    record_quality_report(db, finished, outcome)
     record_event(
         db,
         finished,
@@ -397,6 +465,42 @@ def mark_succeeded(
         },
     )
     return finished
+
+
+def record_quality_report(
+    db: Session, run: ExecutionRun, outcome: ExecutionOutcome
+) -> QualityReport | None:
+    """把质量报告落成可查询的事实（FR-33 / FR-40）。
+
+    ``outcome.detail["quality_report"]`` 是数据面回传的原文，它同时也会进
+    ``EVENT_PROGRESS`` 的快照——那是**流水**（当时回传了什么）。这里落的是
+    **结论**：报告要能被按运行查询、被审计引用，而不是每次查询都去事件载荷里
+    解析一遍 JSON。
+
+    没有 ``quality_report`` 键时不写任何东西。**「没有报告」必须与「报告显示
+    零拒绝」可区分**：前者是这次运行压根没声明质量规则，后者是质量契约确实
+    跑过并且全部通过——把两者合并成「0」，等于把「没检查」说成「检查通过」。
+    """
+    payload = (outcome.detail or {}).get("quality_report")
+    if not payload:
+        return None
+    # 终态写回已由租约串行化，不存在并发；查一次只是让「重复调用」变成无害，
+    # 而不是撞上 ``quality_reports.run_id`` 的唯一约束。
+    if db.scalar(select(QualityReport.id).where(QualityReport.run_id == run.id)):
+        return None
+    report = QualityReport(
+        run_id=run.id,
+        source_rows=int(payload.get("source_rows") or 0),
+        # SPEC §5 的 ``valid_rows`` 就是数据面回传的 ``accepted_rows``（通过校验
+        # 并写入影子表的行）。两者指同一个数字，不新造第三个名字。
+        valid_rows=int(payload.get("accepted_rows") or 0),
+        rejected_rows=int(payload.get("rejected_rows") or 0),
+        error_dist=dict(payload.get("error_dist") or {}),
+        error_table=payload.get("error_table"),
+    )
+    db.add(report)
+    db.commit()
+    return report
 
 
 def mark_failed(
@@ -589,6 +693,14 @@ def request_cancel(db: Session, *, run: ExecutionRun, user_id: uuid.UUID) -> Exe
         run.finished_at = datetime.now(UTC)
         db.commit()
         db.refresh(run)
+        record_audit(
+            db,
+            event_type=EVENT_EXECUTION_CANCELLED,
+            actor=str(user_id),
+            project_id=run.project_id,
+            run_id=run.id,
+            payload={"reason": "尚未开始执行"},
+        )
         record_event(
             db, run, EVENT_CANCELLED, message=f"由 {user_id} 取消（尚未开始执行）"
         )
@@ -598,6 +710,13 @@ def request_cancel(db: Session, *, run: ExecutionRun, user_id: uuid.UUID) -> Exe
     run.cancel_requested_at = datetime.now(UTC)
     db.commit()
     db.refresh(run)
+    record_audit(
+        db,
+        event_type=EVENT_EXECUTION_CANCEL_REQUESTED,
+        actor=str(user_id),
+        project_id=run.project_id,
+        run_id=run.id,
+    )
     record_event(db, run, EVENT_CANCEL_REQUESTED, message=f"由 {user_id} 请求取消")
     return run
 
@@ -609,6 +728,53 @@ def cancel_requested(db: Session, run: ExecutionRun) -> bool:
     """
     db.refresh(run)
     return bool(run.cancel_requested)
+
+
+def cancel_unstarted(
+    db: Session, run: ExecutionRun, *, actor: str, reason: str
+) -> ExecutionRun | None:
+    """把尚未开始的运行直接终止（T-19 维护任务）。
+
+    与 :func:`request_cancel` 的 ``pending`` 分支同构：没有租约、没有副作用、
+    也没有需要协商的对象，直接落终态即可。区别只在**发起方不是用户**——审批
+    已过期时授权不成立，所以没有 ``user_id`` 可记，只有一条说明来源与理由的
+    系统文案。
+
+    条件更新而不是先读后写：从维护任务扫到它、到写回终态之间，Worker 完全可能
+    已经把它认领走。此时它已经是 ``running``，本函数不再有权替它做决定——
+    返回 ``None`` 让调用方知道这次是让位，不是失败。
+    """
+    now = datetime.now(UTC)
+    result = db.execute(
+        update(ExecutionRun)
+        .where(
+            ExecutionRun.id == run.id,
+            ExecutionRun.status == ExecutionRunStatus.PENDING,
+        )
+        .values(
+            status=ExecutionRunStatus.CANCELLED,
+            # 与用户取消同形：对下游而言「这次运行以取消收场」是同一个事实，
+            # 至于是谁按下的、以及为什么，去看事件而不是看这一列
+            cancel_requested=True,
+            cancel_requested_at=now,
+            finished_at=now,
+        )
+    )
+    if result.rowcount != 1:
+        db.rollback()
+        return None
+    db.commit()
+    db.refresh(run)
+    record_audit(
+        db,
+        event_type=EVENT_EXECUTION_CANCELLED,
+        actor=actor,
+        project_id=run.project_id,
+        run_id=run.id,
+        payload={"reason": reason},
+    )
+    record_event(db, run, EVENT_CANCELLED, message=f"由 {actor} 取消：{reason}"[:512])
+    return run
 
 
 # --------------------------------------------------------------------------
@@ -633,6 +799,13 @@ def run_execution(
         logger.info("运行已被认领或已结束，跳过 run=%s", run_id)
         return None
 
+    record_audit(
+        db,
+        event_type=EVENT_EXECUTION_CLAIMED,
+        actor=f"worker:{worker_id}",
+        project_id=run.project_id,
+        run_id=run.id,
+    )
     record_event(db, run, EVENT_CLAIMED, message=f"由 Worker {worker_id} 认领")
     if on_event is not None:
         on_event(EVENT_CLAIMED)
@@ -644,6 +817,23 @@ def run_execution(
         command = load_command(db, run.id)
         # 提交前续一次租约：真正耗时的动作马上开始，租约得先续上
         renew_lease(db, run_id=run.id, worker_id=worker_id)
+        # **命令原文不进账本**：它含一次性能力令牌，而账本是长期档案——
+        # 把凭据写进档案，等于让每一份历史证据都留着一把（已失效的）钥匙。
+        record_audit(
+            db,
+            event_type=EVENT_EXECUTION_SUBMITTED,
+            actor=f"worker:{worker_id}",
+            project_id=run.project_id,
+            run_id=run.id,
+            version_id=run.version_id,
+            payload={
+                "tool": command.tool,
+                "environment": command.environment,
+                "artifact": command.artifact,
+                "target_table": command.target_table,
+                "shadow_table": command.shadow_table,
+            },
+        )
         record_event(db, run, EVENT_SUBMITTED, input_snapshot=command.model_dump(mode="json"))
         if on_event is not None:
             on_event(EVENT_SUBMITTED)
@@ -717,9 +907,15 @@ def run_execution(
             db, run, "执行过程中发生未预期错误（详见服务端日志）", worker_id=worker_id
         )
 
-    if cancel_requested(db, run):
+    if cancel_requested(db, run) and not outcome.published:
         return mark_cancelled(
             db, run, worker_id=worker_id, reason="执行完成后收到取消请求，不发布结果"
         )
+
+    if outcome.published and cancel_requested(db, run):
+        # 取消赶到时换表已经发生：把一次已生效的发布记成「已取消」，会让审计里
+        # 出现「正式表没动过」的假象，而它动过了，只是没来得及拦。如实收尾为成功，
+        # 取消请求本身仍留在 run.cancel_requested 与它的请求事件上。
+        logger.warning("取消在发布完成后才到达 run=%s，按已发布收尾", run.id)
 
     return mark_succeeded(db, run, outcome, worker_id=worker_id)

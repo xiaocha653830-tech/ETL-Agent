@@ -25,9 +25,11 @@ from app.models.datasource import Datasource, DatasourceType
 from app.models.version import PipelineVersion, VersionStatus
 from app.schemas.capability import BindingContext
 from app.schemas.execution import ExecutionCommand
+from app.services.audit import LedgerInvocationSink
 from app.services.budget import BudgetUsage, BudgetVerdict, evaluate
 from app.services.commit import EXECUTION_TOOL
 from app.services.credentials import CredentialService, get_credential_service
+from app.services.diagnosis import diagnose
 from app.services.execution import (
     BudgetExceeded,
     DataplaneCancelled,
@@ -37,7 +39,7 @@ from app.services.execution import (
     PollDecision,
 )
 from app.services.quality import DorisPublisher, QualityReport, compile_quality_config
-from app.services.tool_broker import InMemoryInvocationSink, ToolBroker
+from app.services.tool_broker import ToolBroker
 from app.services.versioning import compute_fingerprint
 
 logger = logging.getLogger(__name__)
@@ -331,7 +333,8 @@ class SeaTunnelDataPlane:
         self._clock = clock
         self._sleep = sleep
         self._publisher_factory = publisher_factory or DorisPublisher
-        self._invocations = InMemoryInvocationSink()
+        # 工具调用的留痕落进证据账本（SPEC §10.1 曾把不落库称为「待补的真实缺陷」）
+        self._invocations = LedgerInvocationSink()
 
     def _submit_http(self, *, config: str, job_name: str) -> dict[str, Any]:
         path = "/submit-job?" + urlencode({"format": "hocon", "jobName": job_name})
@@ -394,9 +397,16 @@ class SeaTunnelDataPlane:
                     # 不会被覆盖；反过来把超预算记成「取消」，这条事实就没有载体了。
                     verdict = watch.observe(metrics)
                     if verdict.exceeded:
+                        # 根因诊断在中断这一刻算出来并入快照（FR-37）。放在这里
+                        # 而不是查询时现算，是为了让它与事件一起冻结——否则将来
+                        # 调整一句建议文案，历史运行的结论就被悄悄改写了。
+                        snapshot = verdict.as_snapshot()
+                        snapshot["diagnosis"] = [
+                            item.as_dict() for item in diagnose(command.budget, verdict)
+                        ]
                         return PollDecision.budget_exceeded(
                             reason=f"超预算硬中断：{verdict.headline}",
-                            snapshot=verdict.as_snapshot(),
+                            snapshot=snapshot,
                         )
                     return requested
 
@@ -411,6 +421,9 @@ class SeaTunnelDataPlane:
                     read_rows=outcome.read_rows,
                     written_bytes=outcome.written_bytes,
                     rejected_rows=report.rejected_rows,
+                    # 只有走到这里才算真的换过表。异常路径（预算中断、取消、
+                    # 拒绝发布）都在上面抛出，绝不会带着 published=True 离开。
+                    published=True,
                     detail={
                         **(outcome.detail or {}),
                         "quality_report": report.as_dict(),

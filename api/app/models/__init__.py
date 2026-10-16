@@ -12,6 +12,12 @@ from app.models.approval import (
     PreparationStatus,
     RiskLevel,
 )
+from app.models.audit import (
+    AuditChainHead,
+    AuditRecord,
+    AuditVerification,
+    IntegrityStatus,
+)
 from app.models.capability import Capability
 from app.models.datasource import (
     Datasource,
@@ -30,18 +36,23 @@ from app.models.execution import (
 )
 from app.models.identity import Membership, Project, User, UserRole
 from app.models.pipeline import PipelineRun, PipelineRunStatus
+from app.models.quality import QualityReport
 from app.models.version import PipelineVersion, VersionStatus
 
 __all__ = [
     "Approval",
     "ApprovalDecision",
     "ApprovalDimension",
+    "AuditChainHead",
+    "AuditRecord",
+    "AuditVerification",
     "Capability",
     "Datasource",
     "DatasourceStatus",
     "DatasourceType",
     "ExecutionRun",
     "ExecutionRunStatus",
+    "IntegrityStatus",
     "Membership",
     "MetadataProfile",
     "OutboxEvent",
@@ -52,6 +63,7 @@ __all__ = [
     "Preparation",
     "PreparationStatus",
     "Project",
+    "QualityReport",
     "RiskLevel",
     "RunEvent",
     "RunOperation",

@@ -84,7 +84,7 @@ class _Publisher:
         self.with_quality_rules = with_quality_rules
 
     def report(self, *, source_rows, budget, with_quality_rules):
-        return QualityReport(source_rows, source_rows, 0, 0.0, None)
+        return QualityReport(source_rows, source_rows, 0, 0.0, None, {})
 
     def rejected_rows(self):
         return None
@@ -396,6 +396,32 @@ def test_budget_breach_stops_the_engine_job(session_factory, seatunnel_world):
     snapshot = caught.value.snapshot
     assert [item["dimension"] for item in snapshot["breaches"]] == ["max_rows"]
     assert snapshot["observed"]["read_rows"] == 12
+    # 根因诊断随快照一起冻结（FR-37）：它是「为什么停」的结论，不能等查询时
+    # 再算——那会让将来的一次文案调整改写历史运行的解释。
+    (diagnosis,) = snapshot["diagnosis"]
+    assert diagnosis["dimension"] == "max_rows"
+    assert diagnosis["cause"] == "source_volume"
+    assert diagnosis["suggestion"]
+
+
+def test_a_declared_but_unmeasurable_dimension_is_diagnosed(
+    session_factory, seatunnel_world
+):
+    """声明了放大比却量不到源端字节数，也要一并说出来（FR-37）。
+
+    这种情形**不会出现在 ``breaches`` 里**——没判过的维度不会越界。只报越界的
+    实现会让「预算形同未设」看起来像一切正常，而那恰恰是最该被看见的失败。
+    """
+    plane, _ = _plane(["RUNNING", "RUNNING"])
+    with session_factory() as db:
+        command = _rebudget(
+            db, seatunnel_world, {"max_rows": 5, "max_amplification_ratio": 2.0}
+        )
+        with pytest.raises(BudgetExceeded) as caught:
+            plane.submit(command, db=db, on_poll=_proceed)
+
+    causes = {item["cause"] for item in caught.value.snapshot["diagnosis"]}
+    assert causes == {"source_volume", "metric_unavailable"}
 
 
 def test_budget_breach_on_the_final_poll_still_blocks_publication(
@@ -528,3 +554,68 @@ def test_cancel_arriving_before_the_final_poll_never_publishes(
             plane.submit(seatunnel_world, db=db, on_poll=_cancel_at_the_end)
 
     assert getattr(spy, "published", False) is False
+
+
+# --------------------------------------------------------------------------
+# T-18：发布事实的落账（FR-34 / FR-38）
+# --------------------------------------------------------------------------
+
+
+def test_publish_is_recorded_on_the_run_row(session_factory, seatunnel_world):
+    """换表这件事必须落在运行行上，否则回滚无从判断影子表名下是谁的数据。"""
+    plane, _ = _plane(["RUNNING", "FINISHED"])
+    with session_factory() as db:
+        run = run_execution(
+            db, run_id=seatunnel_world.run_id, worker_id=uuid.uuid4(), plane=plane
+        )
+        assert run.status is ExecutionRunStatus.SUCCEEDED
+        assert run.published_at is not None
+        events = [event.message for event in db.query(RunEvent).filter_by(run_id=run.id)]
+        assert "执行完成，正式表已替换" in events
+
+
+def test_failed_run_never_claims_to_have_published(session_factory, seatunnel_world):
+    """没走到 publish 的运行不得留下发布痕迹——回滚据此决定要不要删表。"""
+    plane, _ = _plane(["FAILED"])
+    with session_factory() as db:
+        run = run_execution(
+            db, run_id=seatunnel_world.run_id, worker_id=uuid.uuid4(), plane=plane
+        )
+        assert run.status is ExecutionRunStatus.FAILED
+        assert run.published_at is None
+
+
+def test_cancel_arriving_after_the_swap_is_not_recorded_as_cancelled(
+    session_factory, seatunnel_world
+):
+    """FR-29 / FR-38：取消若在换表已经生效之后才到达，运行必须记成成功。
+
+    记成「已取消」会让审计显示「正式表没动过」——而它动过了。这里的模拟方式是
+    让 ``publish()`` 在返回前把取消标志写进库（等价于一次恰好赶在换表之后抵达的
+    取消请求）。
+    """
+
+    class _LateCancelPublisher(_Publisher):
+        def publish(self):
+            super().publish()
+            with session_factory() as other:
+                pending = other.get(ExecutionRun, seatunnel_world.run_id)
+                pending.cancel_requested = True
+                other.commit()
+
+    plane = SeaTunnelDataPlane(
+        transport=_Transport(["RUNNING", "FINISHED"]),
+        credentials=_Credentials(),
+        publisher_factory=lambda db, command, credentials: _LateCancelPublisher(),
+        poll_interval=0.01,
+        job_timeout=2,
+        sleep=lambda _: None,
+    )
+    with session_factory() as db:
+        run = run_execution(
+            db, run_id=seatunnel_world.run_id, worker_id=uuid.uuid4(), plane=plane
+        )
+        assert run.status is ExecutionRunStatus.SUCCEEDED
+        assert run.published_at is not None
+        # 取消请求本身仍留痕，不被抹掉
+        assert run.cancel_requested is True

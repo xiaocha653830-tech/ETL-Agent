@@ -121,7 +121,7 @@ flowchart LR
 - **Windows 平台约束（2026-10-13 实测确认）**：本机为 Windows 11 + Docker Desktop（WSL2 后端），以下三点已改变原设计假设——
   1. **容器 IP 对宿主机不可路由**。实测宿主可访问映射端口（`127.0.0.1:8040`）但访问容器 IP（`172.30.80.5`）100% 丢包。Doris 的 Stream Load 要求客户端拿到 FE 返回的 **BE 地址后直连 BE**，因此**数据面组件（SeaTunnel）必须与 Doris 处于同一 Docker 网络**，不能部署在宿主机上（原 §4 拓扑假设二者同机即可）。**这也意味着 M9 数据面适配器应与 SeaTunnel 同容器网络部署。**
   2. **端口映射须避让 Windows 保留段**。实测保留段 `8978-9077` 罩住 Doris 默认的 9030（`bind: forbidden by access permissions`），宿主映射改用 8050；且 winnat 还会动态保留端口，内部通信端口（9010/9050/9060）不应暴露到宿主。
-  3. **Doris BE 有内核前置条件**：需 `vm.max_map_count >= 2000000` 且**关闭 swap**，否则 BE 容器 entrypoint 主动 `Exited (0)`。WSL2 各发行版共享内核，在任一发行版设置即全局生效。
+  3. **Doris BE 有内核前置条件**：需 `vm.max_map_count >= 2000000` 且**关闭 swap**，否则 BE 容器 entrypoint 主动 `Exited (0)`。WSL2 各发行版共享内核，因此在任一发行版设置即全局生效——但**共享内核不等于持久**：`sysctl -w` 与 `swapoff -a` 都只影响当前会话。swap 已由 `.wslconfig` 的 `swap=0` 永久关闭（`vm.swappiness=0` 不满足 BE 对交换设备的检查，不能替代）；`vm.max_map_count` 的持久化尚未落地，WSL 重启后需手动重新应用。详见 `deploy/README.md` 第六节。
 
 ## 5. 数据模型（ER）
 
@@ -257,11 +257,14 @@ erDiagram
 | `CAPABILITY` | `consumed` 默认 false；签发时写 `expires_at = now + 5min` | 单次消费（FR-27） |
 | `EXECUTION_RUN` | `worker_lease_owner` + `lease_expires_at` | 租约 fencing，防旧 Worker 写回终态 |
 | `RUN_OPERATION` | `(run_id, operation_key)` UNIQUE | 幂等台账，副作用仅执行一次（FR-27） |
+| `QUALITY_REPORT` | `run_id` UNIQUE；随运行级联删除 | 一次运行至多一份质量结论（FR-33 / FR-40） |
 | `AUDIT_RECORD` | `seq` UNIQUE 递增；`prev_hash` 指向上一条 `entry_hash` | 哈希链防篡改（FR-39） |
 | `OUTBOX_EVENT` | `idempotency_key` UNIQUE；`status/attempts/available_at` 索引 | 原子投递 + 指数退避（FR-28） |
 | 全部业务表 | 外键带 `project_id`，跨租户查询在 SQL 层强制过滤 | 多租户隔离（FR-44） |
 
 > **与 PRD 第 8 章的一致性**：PRD 的 11 个实体全部保留；本规格**新增 3 张**（`RUN_OPERATION` 幂等台账、`RUN_EVENT` 事件时间线、`OUTBOX_EVENT` 投递表），来源为附录 D.1「实体分层」（Task ≠ Run ≠ RunEvent ≠ Operation）。`AUDIT_RECORD` 在 PRD 基础上补充 `seq / entry_hash` 以支持哈希链。
+>
+> **T-20 实施时另增 2 张**：`AUDIT_CHAIN_HEAD`（每条链的链头——既是并发写入的串行化点，也是**防尾部截断的锚**：只删链尾会留下一条完全自洽的短链，任何记录内部都发现不了，把末条的 `seq`/`hash` 独立存放才暴露得出来）与 `AUDIT_VERIFICATION`（校验历史——校验结论不能写进它正在校验的那条链，否则校验器要校验自己）。`AUDIT_RECORD` 另补 `payload / project_id / occurred_at / chain_id` 与四个引用列；**引用列刻意不建外键**：级联删除会让「删掉运行」变成「删掉运行的全部证据」，置空则是数据库层对不可变行的合法改写，两者都与 FR-39 冲突——证据应当比它引用的对象活得久。
 
 ## 6. 关键接口定义
 
@@ -277,6 +280,9 @@ erDiagram
 | API-08 | POST | `/api/v1/commits` | Commit：复核审批事实 → 签发 Capability → 写 Outbox | FR-25、FR-26 |
 | API-09 | GET | `/api/v1/runs/{id}` | 查询运行状态与度量 | FR-29、FR-30 |
 | API-10 | POST | `/api/v1/runs/{id}/rollback` | 受管回滚 | FR-38 |
+| API-11 | GET | `/api/v1/audit/records` | 检索证据链（keyset 分页，按项目强制过滤） | FR-39 |
+| API-12 | GET | `/api/v1/audit/verification` | 链完整性校验结论（`refresh=true` 现场重算） | FR-39 |
+| API-13 | GET | `/api/v1/audit/report` | 导出自包含审计报告（JSON / NDJSON） | FR-40 |
 
 **OpenAPI 片段示例（API-08 Commit）**：
 
@@ -507,12 +513,12 @@ sequenceDiagram
 | T-12 Commit 收口 | ✅ 完成 | `api/app/services/commit.py`、`api/app/api/routes/commits.py`、`api/app/models/execution.py`（`execution_runs` / `outbox_events`） |
 | T-13 Outbox 分发与任务认领 | ✅ 完成 | `api/app/services/outbox.py`、`api/app/services/execution.py`、`api/app/worker/`（Celery）、`api/app/api/routes/runs.py` |
 | T-14 租约 fencing 与取消 | ✅ 完成 | `api/app/services/lease.py`、`api/app/services/execution.py`、`run_operations` 幂等台账 |
-| T-15 SeaTunnel REST 适配 | 🟨 已实现、真实冒烟通过、完整受管链路待复验 | `api/app/services/seatunnel.py`、`deploy/seatunnel-zeta.compose.yml`；REST 提交/轮询/停止、冻结指纹复核、参数注入与影子表约束 |
-| T-16 质量与发布 | 🟨 部分实现、完整验收未通过 | `api/app/services/quality.py`、`api/tests/test_quality.py`；规则编译、错误分流、行数/拒绝率/Schema 校验与保留旧表的原子 Swap |
-| T-17 预算监督与诊断 | 🟨 开发中 | `api/app/services/budget.py`、`execution.py`、`seatunnel.py`、`api/tests/test_budget.py`；五维判定、停止请求及失败快照，真实中断与根因诊断待验证/实现 |
-| T-18 受管回滚 | ⬜ 未形成完整实现 | 尚无 API-10 路由与受管回滚执行流程；保留旧表不等同于已实现回滚 |
-| T-19 维护任务 | ⬜ 未实现 | 超时回收、审批过期级联终止与租约回收重排待实现 |
-| T-20 证据账本 | ⬜ 未实现 | 现有运行事件不是哈希链账本；账本落库、校验器与审计报告待实现 |
+| T-15 SeaTunnel REST 适配 | ✅ 完成（真实受管链路已验证） | `api/app/services/seatunnel.py`、`deploy/seatunnel-zeta.compose.yml`；REST 提交/轮询/停止、冻结指纹复核、参数注入与影子表约束 |
+| T-16 质量与发布 | ✅ 完成（真实受管链路已验证 7/1 分流与原子发布） | `api/app/services/quality.py`、`api/app/models/quality.py`、`api/tests/{test_quality,test_quality_report}.py`；规则编译、错误分流、行数/拒绝率/Schema 校验、保留旧表的原子 Swap，以及**质量报告的独立实体与查询接口（FR-33 / FR-40）** |
+| T-17 预算监督与诊断 | ✅ 完成（真实引擎中断已验证：行数与拒绝率两维均拦截且未发布） | `api/app/services/budget.py`、`diagnosis.py`、`execution.py`、`seatunnel.py`、`api/tests/{test_budget,test_diagnosis,test_seatunnel}.py`；FR-35 五维判定、FR-36 硬中断/失败快照，以及 **FR-37 可解释根因诊断（随中断快照冻结）** 均已实现并测试；真实引擎中断验证仍待环境就绪 |
+| T-18 受管回滚 | ✅ 完成 | `api/app/services/rollback.py`、`api/app/api/routes/runs.py`（API-10）、`api/alembic/versions/a1c7f2e4d905_run_publication_and_rollback.py`（`published_at`/`rolled_back_at`）、`api/tests/test_rollback.py` |
+| T-19 维护任务 | ✅ 完成 | `api/app/services/maintenance.py`、`lease.py`（`reclaim_lease`）、`outbox.py`（`find_by_run`/`requeue`）、`api/app/worker/`（`maintenance.sweep` 入 Beat 调度）、`api/tests/test_maintenance.py` |
+| T-20 证据账本 | ✅ 完成 | `api/app/models/audit.py`（3 表）、`services/{audit,audit_verifier,audit_report}.py`、`api/routes/audit.py`（API-11~13）、`api/scripts/verify_audit_chain.py`；哈希链落库、签名检查点、校验器（启动 + 巡检）、自包含审计报告 |
 | T-21 Benchmark | ⬜ 未实现 | 版本化评测集、分层评测与准确率大盘待实现 |
 | T-22 前端 | 🟨 静态原型阶段 | `docs/prototype/etl-agent.pen`、`docs/prototype-html/`；Vue 业务前端与接口联调未完成 |
 | T-23 全链路联调 | ⬜ 未完成 | 待质量发布、预算监督、回滚及前端等前置任务收口 |
@@ -525,12 +531,18 @@ sequenceDiagram
 
 **测试记录（2026-10-16）**：最近一次完整检查命令为
 `cd api && ./.venv/Scripts/python.exe -m pytest -q -o addopts= --tb=short`，
-最新结果为 **371 个用例全部通过**（90.88 秒），覆盖 T-01 ~ T-14、REST 适配、
-质量编译与发布替身、预算判定及中断流程。
+最新结果为 **458 个用例全部通过**（94.98 秒），覆盖 T-01 ~ T-20、REST 适配、
+质量编译与发布替身、质量报告落库与查询、预算判定与根因诊断、中断流程，以及
+证据账本（链、锚点、校验、接口、覆盖率）。新增用例集中在
+`test_audit_{ledger,verifier,api,coverage}.py`：其中 `test_audit_verifier.py`
+逐条验证「篡改可被检出」（改内容 / 删中间条 / 改指针 / 翻转签名 / **删尾部截断** /
+绕过追加路径插入），并断言密钥轮换时是 `indeterminate` 而**非** `breached`；
+`test_audit_api.py` 里有一条**离线复算**——只用报告自身公布的配方与公钥重算整条链，
+不调用被测代码的任何哈希函数。
 此前 `test_worker_records_budget_failure_with_failure_snapshot` 检出越界轮次的
 `read_rows` 应为 12、实际为 0：预算判定提前返回，跳过执行层进度写回。
 工作区已调整为先记录进度/续租、再判定预算，该用例及完整测试均已通过回归。
-本轮仍有 402 条 JWT 测试密钥长度警告，不影响测试通过，但测试结果不代表部署配置已完成安全验收。
+本轮仍有 408 条 JWT 测试密钥长度警告，不影响测试通过，但测试结果不代表部署配置已完成安全验收。
 测试按 §4 使用**内存 SQLite + 替身数据源 + 替身模型 + 替身数据面**，不依赖
 PostgreSQL / Redis / Vault，也不消费大模型额度。替身测试不等于真实集群或真实模型验收。
 
@@ -539,24 +551,66 @@ PostgreSQL / Redis / Vault，也不消费大模型额度。替身测试不等于
 链路跑通，冻结产物的 SHA256 指纹可复算；迁移经 `alembic upgrade head` / `downgrade` 往返
 与 `alembic check`（模型与库零差异）验证。
 
+**全链路验收（2026-10-16，真实环境）**：容器齐备（PostgreSQL / Redis / Vault / 演示 MySQL /
+Doris FE+BE / SeaTunnel Zeta），后端三层以 `DATA_PLANE_BACKEND=seatunnel` 运行。
+
+| 环节 | 实测结果 |
+|------|---------|
+| M2 数据源探查 | 目标 Doris 探到 28 张表（`tables_limit` 默认 20；表多时须显式放宽，否则新表进不了 Schema 对齐） |
+| M5 门禁冻结 | 5 项检查全部执行；「Schema 对齐」曾在目标表未进探查结果时真实拦截（409） |
+| M6 准备单与双维审批 | 风险分级 P1；data 与 security 两维由不同账号独立签署 |
+| M8 调度 | Outbox → Beat（15 秒）→ Worker 认领 |
+| M9 数据面 | SeaTunnel Zeta 搬运 8 行 |
+| M10 质量与发布 | 7 行有效 / 1 行错误，影子表原子换入正式表 |
+| T-17 预算监督 | `max_reject_ratio` 与 `max_rows` 两个维度实测硬中断为 `failed`，正式表未被触碰 |
+| T-18 受管回滚 | 已发布运行的回滚被拒（409 `BIZ_ROLLBACK_UNAVAILABLE`）；失败运行的残留被清理且未触及正式表；重复调用返回 `executed: false` |
+| T-14 取消 | pending 阶段取消 → `cancelled`，作业从未提交（`read_rows=0`）、未发布 |
+| FR-33 / FR-40 | 质量报告经 `GET /runs/{id}` 可查：`rejected_ratio=0.125`、`error_dist={"USER_NAME_REGEX": 1}` |
+| M3 / M4 真实模型 | `/pipelines/generate` 与 `resume` 真实调用 DeepSeek，方案经完整审批与执行链路验证，见下 |
+
+**真实模型链路已跑通**（`LLM_BACKEND=deepseek`，配置密钥后）：`/pipelines/generate` 4.1 秒
+返回 `interrupted`，抛出澄清问题「目标端的 ods 库需要写入哪张表？」——模型不臆造目标表，
+符合 FR-09；`/pipelines/{run}/resume` 补充答复后返回 `succeeded`。产出的方案只使用注册表内的
+`seatunnel.source.Jdbc` / `seatunnel.sink.Doris` 两个算子（FR-11 / FR-14），字段映射 4 条，
+`quality_rules` 为空（FR-32 要求由工程师声明，模型未越权生成），并给出 3 条提示，
+其中一条是「目标表未在可用表清单中，请确认已创建且结构与源端一致」——幻觉防护确实生效。
+
+该方案的执行链路同样走通：冻结 v14 → 准备单（**风险 P0**）→ 双维审批 → Commit → 执行，
+结果与固定种子一致：8 行 → 7 行有效 / 1 行错误，正式表不含「吴十」。风险评级更高的原因是
+准备单的依据里写着「涉及 L3（机密）字段」与「汇端为覆盖写（影子表 + 原子 Swap）」——
+固定种子把 `sensitivity_level` 硬编码成 L2，模型方案则依探查结果定级为 L3。这是两条路径的
+实质差异，也说明敏感分级确实参与了风险判定。
+
+生成准确率（PRD 的模型验收指标）仍需在版本化评测集（T-21）上度量。
+
 **T-15 的实现与验证边界**：`app/services/execution.py` 通过 `DataPlane` 协议调用数据面。
 默认 `DATA_PLANE_BACKEND=unavailable` 时运行明确失败；显式切换至 `seatunnel` 后，
 适配器从冻结版本取配置、在运行时注入受管连接参数与影子表、经 Tool Broker
 消费单次令牌，再通过 REST V2 提交、轮询与停止作业。已有真实 FakeSource → Console
 及 MySQL → SeaTunnel Zeta → Doris 冒烟记录，后者读取并写入 8 行。
-长表名导致导入 label 超长的问题已通过缩短受管运行前缀修正，但完整受管链路仍需稳定复验。
+长表名导致导入 label 超长的问题已通过缩短受管运行前缀修正；受管链路已于 2026-10-16 完整跑通。
 
 **T-16 的实现与验证边界**：FR-32 的规则声明纳入冻结指纹；执行阶段将规则编译为
-SeaTunnel `DataValidator` 多表分流配置。当前只执行 `not_null` / `regex` 的 `reject` 规则，
-`range` / `enum` / `warn` 等不支持的规则会明确阻止执行，不能静默跳过或据此缩减需求基线。
+SeaTunnel `DataValidator` 多表分流配置。当前只执行 `not_null` / `regex` 的 `reject` 规则；
+`range` / `enum` 属引擎能力缺口，在编译期明确拒绝；`warn` 则更在**声明期**就被契约
+拒绝（`schemas.pipeline.QualityRule` 只接受 `reject`）——它与 FR-33 的分流语义本身
+冲突，「告警但放行」等于把违规行发布出去。两者都不能静默跳过或据此缩减需求基线。
 发布前检查源端行数等于有效行数加错误行数、拒绝率未越过批准预算、两表 Schema 一致，
 再执行 `REPLACE WITH TABLE ... PROPERTIES('swap'='true')`，旧正式表保留在影子表名下。
-质量报告目前保存在运行事件快照中，尚无独立 `QUALITY_REPORT` 实体与报告查询接口。
+质量报告落为独立 `QUALITY_REPORT` 实体（`api/app/models/quality.py`），随运行详情
+（`GET /runs/{id}`）返回，并按错误码记录拒绝分布（`error_dist`）；它同时仍进运行事件
+快照，作为当时的流水留痕——报告是**结论**（可查询），事件是**流水**（当时回传了什么）。
 
-真实独立冒烟曾验证 8 行源数据分为 7 行有效、1 行错误，并在隔离演示表上完成原子 Swap。
-但最近一次受管演示运行 `76020184-bc9d-4b5f-8944-fdeeb8297619` 返回 `succeeded` 后，
-核对结果为正式演示表 8 行、影子表 8 行、错误表 0 行，未证明该场景预期的 7/1 分流成立。
-该差异原因仍待核实，不能仅凭成功状态把 FR-33/FR-34 标为验收通过。
+**受管链路已于 2026-10-16 完整跑通**（`app/scripts/run_demo_managed_flow.py`）：源端 8 行经
+分流后正式表 7 行（不含被拒的「吴十」）、错误表 1 行并标注 `USER_NAME_REGEX`、
+影子表名下为换下来的旧表，质量报告经 `GET /runs/{id}` 可查。
+
+此前运行 `76020184-bc9d-4b5f-8944-fdeeb8297619` 返回 `succeeded` 却零分流的成因**已查明**，
+且与此前记录的判断不同：规则并非未声明（v2/v3 版本里都有）。真正的成因是规则中的中文
+「吴」在提交时经 Windows GBK 转换被降级为 ASCII `?`——库中实测为 8 字节的 `^[^?].*$`，
+而正确形态 `^[^吴].*$` 是 10 字节。正则语义由「不以吴开头」变为「不以问号开头」，8 行
+因此全部通过。**两份契约都是合法正则**，控制面无从报错，运行状态也仍是成功——
+这一类失败只能靠提交后回读比对发现，演示脚本现已内置该检查。
 固定方案种子绕过真实模型生成，仅用于数据链路验证；演示账号双审是角色隔离的技术模拟，
 不替代独立人员的生产审批。
 
@@ -564,29 +618,65 @@ SeaTunnel `DataValidator` 多表分流配置。当前只执行 `not_null` / `reg
 放大比与拒绝率；适配器逐轮采集度量，越界时请求停止，并以 `BIZ_BUDGET_EXCEEDED`
 失败终态及 `run.budget_exceeded` 快照留痕。结束轮次发现越界也应阻止发布。
 未声明预算或本轮无法观测的比值维度会跳过判定；缺失度量不能被解释为已满足全部预算。
-目前停止路径核对请求回执，尚需真实引擎验证终止结果；可解释根因诊断与修复建议未完成。
+FR-37 根因诊断已实现（`api/app/services/diagnosis.py`）：在中断那一刻按维度给出
+根因分类、解释与**可操作建议**，并额外报告「声明了却判不了」的维度——它不会出现在
+`breaches` 里，却正是「预算形同未设」的那种失败。诊断随 `run.budget_exceeded`
+快照一起冻结，不做查询时现算，以免将来调整一句建议就改写历史运行的结论。
+**真实引擎上的中断已于 2026-10-16 验证**：将 `max_reject_ratio` 收紧至 0.05（1/8 越界）
+与 `max_rows` 收紧至 5（源 8 行越界）各跑一次，两次均以 `failed` 终止、正式表保持 0 行
+未被触碰，且越界快照中带有 FR-37 的根因分类与可操作建议。
 
 **仍未闭环**：
 
-1. **真实模型验证**：§11.1 的 V3（DeepSeek API 可用性）尚无实测闭环证据；
-   替身模型与固定方案不能证明 PRD 的生成准确率验收指标。
-2. **受管质量发布验收**：查明最近一次演示分流结果不一致的原因，核对冻结规则、
-   实际执行配置、质量报告、发布结果与运行审计，并补齐报告查询能力。
-3. **预算监督验收**：指标写回修复已通过回归；仍需验证真实超预算停止、失败快照及不发布，
-   补齐可解释诊断。发布前的取消与租约边界也需覆盖。
-4. **恢复、审计与前端**：按 T-18～T-23 补齐回滚、维护回收、证据账本、Benchmark、
-   Vue 业务页面及全链路演示；现有 fencing、旧表保留、运行事件和静态原型不是这些任务的替代实现。
-5. **演示环境**：2026-10-16 检查时，项目容器仅 SeaTunnel 在运行，PostgreSQL、Redis、
-   演示 MySQL 和 Doris 未运行；该项是检查时快照，完整复验前须重新确认环境。
+1. **真实模型验证**：调用链已闭环（2026-10-16）——配置密钥后 `/pipelines/generate` 与
+   `resume` 均真实调用 DeepSeek，产出的方案经完整审批与执行链路验证。
+   **仍未闭环的是准确率本身**：PRD 的生成质量指标需要在版本化评测集（T-21）上度量，
+   单次成功调用不足以证明。另需注意 `llm_backend` 默认仍为 `fake`（SPEC §4 的开发环境约定），
+   必须显式设为 `deepseek` 才走真实模型。
+2. ~~**受管质量发布验收**~~ **已闭环**（2026-10-16）。此前记录的成因分析有误——规则并非缺失，
+   而是其中的中文在提交时被 Windows GBK 降级成 `?`（`^[^吴].*$` → `^[^?].*$`，10 字节 → 8 字节），
+   使规则静默失去对象。修正提交通道后，受管链路实测 8 行 → 7 行发布 / 1 行错误、
+   旧正式表保留在影子表名下。演示脚本自带提交后回读校验，防止该问题复现。
+   另需更正：当时担心的「`max_reject_ratio` 默认零容忍会拦下 1/8」并不成立——准备单的预算
+   由 `build_budget()` 整组生成、默认拒绝率上限为 0.2（`core/config.py`），
+   取到 0.0 的只是预算字典缺该键时的兜底分支。
+3. **预算监督验收**：主体已闭环（2026-10-16）。行数与拒绝率两个维度在真实引擎上均实测
+   硬中断为 `failed`，正式表未被触碰，越界快照含 FR-37 根因诊断。
+   发布前的取消与租约边界仍待补充真实链路覆盖。
+4. **恢复、审计与前端**：T-18 受管回滚、T-19 维护回收与 **T-20 证据账本**均已实现并通过回归。
+   仍需按 T-21～T-23 补齐 Benchmark、Vue 业务页面与全链路演示；
+   现有 fencing、旧表保留、运行事件和静态原型不是这些任务的替代实现。
+   注意 T-20 修掉了 `InMemoryInvocationSink` 不落库这个缺陷，但 **Broker 目前仍没有注册
+   任何真实工具**，因此 `tool.invoked` 是「接口已就位」而非「已在产生记录」——
+   PRD 的关键事件覆盖率由 Prepare / Approve / Commit / 执行 / 回滚 五类承担。
+5. **演示环境**：2026-10-16 复验时已起齐 PostgreSQL / Redis / Vault / 演示 MySQL
+   与 Doris FE+BE / SeaTunnel Zeta。WSL 的 `vm.max_map_count` 持久化仍未落地，
+   重启后须重新应用，否则 Doris BE 不会启动。
 
 ### 10.2 下一步推进顺序
 
-1. 收口 T-15/T-16：复现并解释受管分流差异，补齐质量报告；验证 8 行输入、7 行发布、
-   1 行错误且旧正式表保留的隔离演示，并验证质量或预算失败时不发布。
-2. 在预算判定与指标写回回归通过的基础上，收口 T-17 的真实中断与诊断，
-   再按依赖推进 T-18 受管回滚。
-3. 推进 T-19 维护回收及 T-20/T-21 审计评测；在依赖和接口就绪后完成 T-22 Vue 前端，
-   最后以 T-23 汇总真实模型、数据链路、异常恢复、审批审计与页面操作的验收证据。
+1. ~~收口 T-15/T-16 的真实链路~~ **已完成**（2026-10-16）：受管链路跑通 7/1 分流与原子发布。
+2. ~~验证真实超预算停止与失败快照~~ **已完成**（2026-10-16）：行数与拒绝率两维实测拦截且未发布。
+   T-18 受管回滚与 T-19 维护回收已实现并通过回归。
+3. ~~推进 T-20 证据账本~~ **已完成**（2026-10-16）。
+4. 推进 T-21 Benchmark 与 T-22 Vue 前端及接口联调；最后以 T-23 汇总真实模型、
+   数据链路、异常恢复、审批审计与页面操作的验收证据。
+
+### 10.3 T-20 的七项实现决策
+
+规格冻结了 `AUDIT_RECORD` 的结构与「逐条哈希 + 按批签名」的定案（Q5），但没有
+规定下面这些事情。它们在本轮实现中定案，理由一并记此，与本规格其余决策痕迹
+同一体例：
+
+| # | 空白 | 定案 | 理由 |
+|---|------|------|------|
+| 1 | 哈希算法 | **SHA-256 hex** | 全仓已有同一选择（`_arguments_digest`、版本指纹），报告里两种指纹并存时语义一致；64 字符与 `String(64)` 天然吻合；不用 HMAC——防篡改的根信任在签名检查点，哈希链只负责「改一处即断链」，用密钥哈希会让第三方无法独立复算 |
+| 2 | 签名格式 | **Ed25519 + 信封 `v1:<kid>:<base64url-nopad>`** | 复用 `core/keys.py` 的 `SigningKey`（Q5 的意图就是同一把密钥）；版本号让「格式变了」与「内容被改了」可区分；`kid` 让密钥轮换后能判断用哪把公钥——**「无法验证」与「验证不通过」是两件事**；base64url 无 padding 避免导出 CSV / URL 时被截断 |
+| 3 | 审计接口 | 新增 **API-11 / 12 / 13**，全部只读 | SPEC §6 的冻结契约与平台支撑接口里都没有审计条目，这是规格空白；按 PRD 第 7 章「审计台」的页面要素补：按时间排序的事件链、哈希链可视化、签名检查点状态、导出入口 |
+| 4 | 报告格式 | **自包含 JSON**（默认）/ NDJSON，内嵌复算配方与公钥 | 需要回查数据库才能验证的报告不算审计报告——它把证据的可信度重新押在一张可被改写的表上。NDJSON 的最后一行是 summary，截断可被消费方识别 |
+| 5 | 链边界 | **全局单链**，`project_id` 只作租户过滤 | 规格定的是「`prev_hash` 指向上一条」——「上一条」是全局序；按项目分链会削弱而不是增强防篡改（整条链被替换时没有全局序可对照）。租户隔离的实施点在 SQL 过滤，不在链的结构 |
+| 6 | 并发写入 | **链头行锁 + `seq` UNIQUE 兜底 + 有界重试** | `seq` 不用数据库序列：序列在事务回滚时会留洞，而「无洞」是硬要求。PostgreSQL 上行锁让分叉物理上不可能；SQLite 的 `FOR UPDATE` 被静默忽略，靠写事务独占 + UNIQUE + 重试收敛，同一份代码两种方言都不出错 |
+| 7 | 校验失败的处置 | **三级**：检测不阻断启动 / 授权类动作硬阻断 / 写入 fail-closed | 把检测变成可用性故障等于给攻击者一个 DoS 杠杆，且运维失去查看证据的路径；但 Commit（签发票据）与回滚（删数据）必须以可信证据链为前提，故只挡这两类。写入失败 fail-closed 的代价被既有幂等台账吸收——`OPERATION_SUBMIT_JOB` 使重排后不会真的重跑 ETL，只补写终态 |
 
 ## 11. 待明确事项
 

@@ -48,10 +48,19 @@ class QualityRule(BaseModel):
     """
 
     field: str = Field(min_length=1, max_length=128)
+    # 四种规则类型表达的是**业务范围**；数据面当前只实现 ``not_null`` / ``regex``，
+    # 另外两种在编译期明确拒绝（``quality.compile_quality_config``）。保留它们，
+    # 是为了把「业务上可以这样要求」与「引擎暂时做不到」分开——后者是能力缺口，
+    # 会随引擎版本消失，不值得写死在契约里。
     rule: Literal["not_null", "range", "enum", "regex"]
     params: dict[str, Any] = Field(default_factory=dict)
     error_code: str = Field(min_length=1, max_length=64)
-    action: Literal["reject", "warn"] = "reject"
+    # 只接受 ``reject``。与上面四种规则类型不同，这不是引擎能力问题：``warn`` 与
+    # FR-33 的分流契约**本身冲突**——「告警但放行」意味着违规行留在结果里被发布
+    # 出去，错误表失去意义、质量门禁形同虚设。语义上不成立的东西不该能在声明阶段
+    # 被写出来：审批人签下的契约必须是能被执行的那一份，而不是等运行到一半才发现
+    # 它跑不了，那时版本已经冻结、改不动了。
+    action: Literal["reject"] = "reject"
 
 
 class DagNode(BaseModel):

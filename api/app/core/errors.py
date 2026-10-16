@@ -72,6 +72,10 @@ class ErrorCode(StrEnum):
     BIZ_CAPABILITY_NOT_FOUND = "BIZ_CAPABILITY_NOT_FOUND"
     # 运行超出批准的执行预算，被运行时监督硬中断（FR-36）
     BIZ_BUDGET_EXCEEDED = "BIZ_BUDGET_EXCEEDED"
+    # 本次运行不适用受管回滚（FR-38）：影子表名下已是被换下来的旧正式表
+    BIZ_ROLLBACK_UNAVAILABLE = "BIZ_ROLLBACK_UNAVAILABLE"
+    # 运行已不可能自己走到终态，由维护任务回收（T-19）：执行方失联或投递不可达
+    BIZ_RUN_ABANDONED = "BIZ_RUN_ABANDONED"
 
     # ---- SYS_：系统与依赖 ----
     SYS_INTERNAL_ERROR = "SYS_INTERNAL_ERROR"
@@ -90,6 +94,10 @@ class ErrorCode(StrEnum):
     SYS_DATAPLANE_PROTOCOL_ERROR = "SYS_DATAPLANE_PROTOCOL_ERROR"
     # 运行已失去租约（旧 Worker 试图写回终态，或租约被回收）
     SYS_LEASE_LOST = "SYS_LEASE_LOST"
+    # 证据账本追加在重试耗尽后仍未成功（并发竞争下的罕见路径）
+    SYS_AUDIT_APPEND_CONFLICT = "SYS_AUDIT_APPEND_CONFLICT"
+    # 证据链校验不通过——链已被改动，授权类动作被拒绝（FR-39）
+    SYS_AUDIT_INTEGRITY_BREACH = "SYS_AUDIT_INTEGRITY_BREACH"
 
 
 class AppError(Exception):
@@ -184,6 +192,22 @@ class FingerprintMismatch(AppError):
     message = "制品指纹与准备单不一致，拒绝执行"
 
 
+class RollbackUnavailable(AppError):
+    """本次运行不适用受管回滚（FR-38 / API-10）。
+
+    最常见的成因是发布已经生效——``swap=true`` 之后影子表名下躺着的是被换下来的
+    旧正式表，此时「丢弃影子表残留」不再是清理，而是删掉上一版生产数据。
+
+    这是一个**永久性**的拒绝：重试没有意义，换一台机器重试也没有意义。
+    因此它不能与「运行尚未结束，先去取消」那种可重试的冲突（``ResourceConflict``）
+    共用一个码——前端对二者的处理路径完全不同。
+    """
+
+    code = ErrorCode.BIZ_ROLLBACK_UNAVAILABLE
+    status_code = status.HTTP_409_CONFLICT
+    message = "本次运行不适用受管回滚"
+
+
 # --------------------------------------------------------------------------
 # SYS_：系统与依赖
 # --------------------------------------------------------------------------
@@ -255,6 +279,36 @@ class LeaseLost(AppError):
     code = ErrorCode.SYS_LEASE_LOST
     status_code = status.HTTP_409_CONFLICT
     message = "运行租约已失效"
+
+
+class AuditAppendConflict(AppError):
+    """证据账本追加在重试耗尽后仍未成功。
+
+    这条路径应当极其罕见：PostgreSQL 的链头行锁让 ``seq`` 竞争几乎不可能发生，
+    SQLite 下还有 UNIQUE 约束与有界重试兜底。走到这里意味着写入压力超出预期，
+    或链头行被某个长事务长时间占住——两种情况都值得让人来看一眼。
+    """
+
+    code = ErrorCode.SYS_AUDIT_APPEND_CONFLICT
+    status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    message = "证据账本写入冲突，请稍后重试"
+
+
+class AuditIntegrityBreach(AppError):
+    """证据链校验不通过，授权类动作被拒绝（FR-39）。
+
+    **只用于授权类动作**（Commit 签发票据、回滚删数据）——这两种都必须以可信的
+    证据链为前提。纯读接口与普通写不受影响：把所有动作一起阻断，等于让攻击者
+    通过「制造一次篡改」来关停整个系统。
+
+    它也是**永久性**的：重试没有意义，人工 ack 也不存在——本异常只由**一次成功
+    的完整校验**解除。给一个「继续执行」的按钮，就等于把破链降级成一条可以
+    随手划掉的告警。
+    """
+
+    code = ErrorCode.SYS_AUDIT_INTEGRITY_BREACH
+    status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    message = "证据链完整性校验未通过，拒绝执行授权类操作"
 
 
 # --------------------------------------------------------------------------

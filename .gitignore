@@ -23,6 +23,8 @@ venv/
 logs/
 # 本地凭据库（Fernet 加密落盘，内容为密文；仍不入库）
 .secrets.enc
+# Celery Beat 调度数据库（运行时产物，重启后按 beat_schedule 重建）
+celerybeat-schedule*
 
 # ---- 第三方发行包（SeaTunnel 2.3.13 本地发行包，约 500MB，不入库）----
 # 安装与连接器准备步骤见 deploy/README.md 第二节
@@ -32,6 +34,9 @@ seatunnel/
 node_modules/
 dist/
 .vite/
+# Playwright 的失败产物（截图、trace、页面快照），只对当次调试有意义
+test-results/
+playwright-report/
 
 # ---- IDE / OS ----
 .idea/

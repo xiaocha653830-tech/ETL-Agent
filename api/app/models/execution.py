@@ -21,6 +21,7 @@
 import enum
 import uuid
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from sqlalchemy import (
     BigInteger,
@@ -40,6 +41,9 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, TimestampMixin
 from app.db.types import JsonColumn
+
+if TYPE_CHECKING:
+    from app.models.quality import QualityReport
 
 
 class ExecutionRunStatus(enum.StrEnum):
@@ -142,10 +146,32 @@ class ExecutionRun(Base, TimestampMixin):
         DateTime(timezone=True), nullable=True
     )
 
+    # ---- 发布事实（FR-34 / FR-38）----
+    # 影子表是否已被换到正式表名下。**这是受管回滚的安全依据**：`swap=true` 之后，
+    # 影子表名下躺着的是被换下来的旧正式表，此时「丢弃影子表残留」就不再是无害的
+    # 清理，而是删掉上一版生产数据。回滚必须先问过这件事，因此它必须是一个可查询
+    # 的事实，而不是埋在事件快照里的一句话。
+    published_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # 受管回滚的完成时刻（FR-38）。与幂等台账并存：台账保证副作用至多发生一次，
+    # 这个字段让运行列表直接回答「这次运行回滚过没有」，不必回表查台账。
+    rolled_back_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     events: Mapped[list["RunEvent"]] = relationship(
         back_populates="run",
         cascade="all, delete-orphan",
         order_by="RunEvent.created_at",
+    )
+    # 质量报告（T-16）。一对一的依据是 ``quality_reports.run_id`` 上的 UNIQUE；
+    # 它只在声明了质量规则时才存在，所以这里是可空的——「没有报告」与
+    # 「报告显示 0 行被拒」是两件事（前者是没声明规则，后者是规则跑了且都通过）。
+    quality_report: Mapped["QualityReport | None"] = relationship(
+        back_populates="run",
+        uselist=False,
+        cascade="all, delete-orphan",
     )
 
     @property

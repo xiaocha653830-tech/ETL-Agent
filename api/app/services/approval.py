@@ -42,6 +42,13 @@ from app.models.approval import (
 )
 from app.models.identity import Membership, UserRole
 from app.models.version import PipelineVersion, VersionStatus
+from app.services.audit import (
+    EVENT_APPROVAL_DECIDED,
+    EVENT_APPROVAL_DENIED,
+    EVENT_PREPARE_CREATED,
+    EVENT_PREPARE_REISSUED,
+    record_audit,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -278,6 +285,22 @@ def create_preparation(
             approval.comment = None
             approval.decided_at = None
             approval.expires_at = existing.expires_at
+        # 重新发起与新建必须分开记：重置清空了两个槽位，是授权状态的**实质变化**。
+        # 只按事件序列看的话，出现这一条就意味着此前所有批准已作废——那是审计
+        # 在回答「当时凭什么放行」时唯一能看到的线索。
+        record_audit(
+            db,
+            event_type=EVENT_PREPARE_REISSUED,
+            actor=str(user_id),
+            project_id=existing.project_id,
+            version_id=existing.version_id,
+            preparation_id=existing.id,
+            payload={
+                "version_no": version.version_no,
+                "expires_at": existing.expires_at.isoformat(),
+                "reason": "上一轮审批已超时，授权不成立",
+            },
+        )
         db.commit()
         db.refresh(existing)
         logger.info("准备单已超时重置 preparation=%s", existing.id)
@@ -312,6 +335,25 @@ def create_preparation(
         for dimension in (ApprovalDimension.DATA, ApprovalDimension.SECURITY)
     ]
     db.add(preparation)
+    # 先 flush 取得 preparation.id：账本要引用它，而引用列是**裸 UUID**（不建外键，
+    # 免得级联删除能把证据一起带走），所以必须在提交之前把值拿到。
+    db.flush()
+    record_audit(
+        db,
+        event_type=EVENT_PREPARE_CREATED,
+        actor=str(user_id),
+        project_id=preparation.project_id,
+        version_id=preparation.version_id,
+        preparation_id=preparation.id,
+        payload={
+            "version_no": version.version_no,
+            "risk_level": assessment.level.value,
+            "risk_reasons": list(assessment.reasons),
+            "fingerprint": preparation.fingerprint,
+            "expires_at": deadline.isoformat(),
+            "shadow_table": preparation.impact_scope.get("shadow_table"),
+        },
+    )
     db.commit()
     db.refresh(preparation)
     logger.info(
@@ -335,6 +377,33 @@ def _other_of(preparation: Preparation, dimension: ApprovalDimension) -> Approva
     return None
 
 
+def _record_denial(
+    db: Session,
+    *,
+    preparation: Preparation,
+    approval: Approval,
+    user_id: uuid.UUID,
+    reason: str,
+) -> None:
+    """记一次**被拒的审批尝试**，并立即提交。
+
+    它必须自己提交：调用方紧接着就抛异常，业务事务会整体回滚——而「谁试过自批」
+    恰恰是最需要留下的那条记录。这是少数几处账本比业务先落地的位置，理由在于
+    这一次业务动作**没有发生**：账本记的是「有人试过」，不是「有什么被改了」。
+    """
+    record_audit(
+        db,
+        event_type=EVENT_APPROVAL_DENIED,
+        actor=str(user_id),
+        project_id=preparation.project_id,
+        version_id=preparation.version_id,
+        preparation_id=preparation.id,
+        approval_id=approval.id,
+        payload={"dimension": approval.dimension.value, "reason": reason},
+    )
+    db.commit()
+
+
 def decide(
     db: Session,
     *,
@@ -353,24 +422,51 @@ def decide(
     if preparation.is_expired:
         # 超时要落库而不只是报错，否则下次调用还会看到一个「看似可审」的槽位
         preparation.status = PreparationStatus.EXPIRED
-        db.commit()
+        _record_denial(
+            db,
+            preparation=preparation,
+            approval=approval,
+            user_id=user_id,
+            reason="expired",
+        )
         raise ApprovalIncomplete("审批已超时失效，请重新发起 Prepare")
 
     # 职责分离之一：维度角色门槛（数据维度只能由数据审批人审，反之亦然）
     expected_role = DIMENSION_ROLE[approval.dimension]
     if membership.role is not expected_role:
+        _record_denial(
+            db,
+            preparation=preparation,
+            approval=approval,
+            user_id=user_id,
+            reason="dimension_role",
+        )
         raise PermissionDenied(
             f"{DIMENSION_LABEL[approval.dimension]}需由 {expected_role.value} 审批"
         )
 
     # 职责分离之二：不可自批
     if user_id == preparation.created_by:
+        _record_denial(
+            db,
+            preparation=preparation,
+            approval=approval,
+            user_id=user_id,
+            reason="self_approval",
+        )
         raise SelfApprovalDenied("职责分离：申请人不可以审批自己提交的版本")
 
     # 职责分离之三：同一人不可占两个槽位。
     # 正常角色矩阵下结构性不可达，但角色变更可以绕过它——显式判定兜底。
     other = _other_of(preparation, approval.dimension)
     if other is not None and other.approver_id == user_id:
+        _record_denial(
+            db,
+            preparation=preparation,
+            approval=approval,
+            user_id=user_id,
+            reason="duplicate_slot",
+        )
         raise SelfApprovalDenied(
             f"职责分离：同一人不可同时占用{DIMENSION_LABEL[other.dimension]}与"
             f"{DIMENSION_LABEL[approval.dimension]}两个审批槽位"
@@ -382,6 +478,21 @@ def decide(
     approval.decided_at = datetime.now(UTC)
 
     _refresh_status(preparation)
+    record_audit(
+        db,
+        event_type=EVENT_APPROVAL_DECIDED,
+        actor=str(user_id),
+        project_id=preparation.project_id,
+        version_id=preparation.version_id,
+        preparation_id=preparation.id,
+        approval_id=approval.id,
+        payload={
+            "dimension": approval.dimension.value,
+            "decision": decision.value,
+            "comment": comment,
+            "preparation_status": preparation.status.value,
+        },
+    )
     db.commit()
     db.refresh(preparation)
     if version is not None:

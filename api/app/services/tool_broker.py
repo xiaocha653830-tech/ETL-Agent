@@ -74,9 +74,17 @@ class ToolInvocation:
 
 
 class InvocationSink(Protocol):
-    """调用记录落点协议 —— T-20 可实现为写库 + 哈希链。"""
+    """调用记录落点协议 —— T-20 已把它实现为写库 + 哈希链。
 
-    def record(self, invocation: ToolInvocation) -> None: ...
+    ``db`` 是 T-20 加上的：写库必须有会话，而 Broker 是在 ``finally`` 里留痕的，
+    那一刻它正持有调用方的事务。把会话**传进去**（而不是让落点自己开一个）是为了
+    让留痕落在同一个事务里——工具确实被调用了、但业务事务回滚了，两者要么一起
+    留痕要么一起不留，不会出现一半。``InMemoryInvocationSink`` 忽略这个参数。
+    """
+
+    def record(
+        self, invocation: ToolInvocation, *, db: Session | None = None
+    ) -> None: ...
 
 
 class InMemoryInvocationSink:
@@ -86,7 +94,11 @@ class InMemoryInvocationSink:
         self._records: list[ToolInvocation] = []
         self._lock = threading.Lock()
 
-    def record(self, invocation: ToolInvocation) -> None:
+    def record(
+        self, invocation: ToolInvocation, *, db: Session | None = None
+    ) -> None:
+        # ``db`` 保持签名兼容但被忽略：这个落点本就不落库，它存在是为了让测试与
+        # 开发环境不必架一张账本表。真正落库的是 ``audit.LedgerInvocationSink``。
         with self._lock:
             self._records.append(invocation)
 
@@ -231,7 +243,8 @@ class ToolBroker:
                         side_effect=True,
                         succeeded=succeeded,
                         invoked_at=datetime.now(UTC),
-                    )
+                    ),
+                    db=db,
                 )
 
 

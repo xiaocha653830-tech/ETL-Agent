@@ -61,6 +61,27 @@ class CommitAcceptedOut(BaseModel):
     artifact: str
 
 
+class QualityReportOut(BaseModel):
+    """一次运行的质量结论（FR-33 / FR-40，SPEC §5 ``QUALITY_REPORT``）。
+
+    ``rejected_ratio`` 由服务端派生（拒绝行数 / 源端行数），不在库里另存一列——
+    它和那两个数字必须是同一个值。
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    run_id: uuid.UUID
+    source_rows: int
+    valid_rows: int
+    rejected_rows: int
+    rejected_ratio: float
+    # 错误码到行数的分布，如 ``{"USER_NAME_REGEX": 1}``——这是报告里唯一
+    # 指向「该去改哪条规则」的信息。
+    error_dist: dict[str, int]
+    # 错误明细所在的表；没有质量规则时为 None
+    error_table: str | None
+
+
 class ExecutionRunOut(BaseModel):
     """运行状态与度量（API-09 / FR-29 / FR-30）。"""
 
@@ -83,4 +104,27 @@ class ExecutionRunOut(BaseModel):
     error: str | None
     started_at: datetime | None
     finished_at: datetime | None
+    # 发布与回滚两个事实（FR-34 / FR-38）：前端凭 ``published_at`` 判断
+    # 「这次运行动过正式表没有」，凭 ``rolled_back_at`` 判断残留是否已清理。
+    # 不让前端去猜——这两个判断都关系到能不能点回滚。
+    published_at: datetime | None
+    rolled_back_at: datetime | None
+    # 质量结论（FR-33 / FR-40）。**为 None 表示这次运行没有质量契约**，
+    # 与「报告显示零拒绝」是两回事——运行列表不该让两者看起来一样。
+    quality_report: QualityReportOut | None = None
     created_at: datetime
+
+
+class RollbackResultOut(BaseModel):
+    """API-10 受理结果（FR-38）。
+
+    ``executed`` 区分「本次真的清了」与「此前已经清过」：重复点击回滚是安全的，
+    但调用方有权知道这一次到底有没有动过手。
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    run_id: uuid.UUID
+    executed: bool
+    dropped: list[str]
+    reason: str

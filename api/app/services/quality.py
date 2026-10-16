@@ -64,6 +64,9 @@ def compile_quality_config(
     field_rules: list[str] = []
     for rule in rules:
         if rule.get("action") != "reject":
+            # 声明端（``schemas.pipeline.QualityRule``）已只接受 ``reject``；这里保留
+            # 一道防线，因为**冻结过的历史版本**里仍可能带着 warn 规则，而冻结版本
+            # 改不动。宁可执行时明确失败，也不静默降级成「告警放行」。
             raise DataplaneProtocolError("当前数据面不支持 warn 规则，拒绝跳过质量契约")
         field = str(rule.get("field") or "")
         code = str(rule.get("error_code") or "")
@@ -112,6 +115,26 @@ def compile_quality_config(
     return config.replace(f'table = "{shadow_table}"', 'table = "${table_name}"', 1)
 
 
+def _error_code(raw: Any) -> str:
+    """从错误表的一行 ``validation_errors`` 里取出错误码。
+
+    空值归到 ``(未标注)``——用空字符串或 ``None`` 当键会和真实错误码混淆，
+    而「一个没写错误码的拒绝」本身就是需要被看见的异常。解析不出结构化错误
+    时保留原值，宁可让它看起来可疑，也不假装它属于某条已知规则。
+    """
+    if not raw:
+        return "(未标注)"
+    try:
+        parsed = json.loads(str(raw))
+    except ValueError:
+        return str(raw)
+    if isinstance(parsed, list) and parsed:
+        first = parsed[0]
+        if isinstance(first, dict) and first.get("error_message"):
+            return str(first["error_message"])
+    return str(raw)
+
+
 @dataclass(frozen=True)
 class QualityReport:
     source_rows: int
@@ -119,6 +142,9 @@ class QualityReport:
     rejected_rows: int
     rejected_ratio: float
     error_table: str | None
+    # 错误码到行数的分布。**没有它，报告只能告诉人「拒了 300 行」**，
+    # 而人无从知道该去改哪一条规则——这是报告里唯一有行动指向的信息。
+    error_dist: dict[str, int]
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -127,6 +153,7 @@ class QualityReport:
             "rejected_rows": self.rejected_rows,
             "rejected_ratio": self.rejected_ratio,
             "error_table": self.error_table,
+            "error_dist": self.error_dist,
         }
 
 
@@ -262,6 +289,29 @@ class DorisPublisher:
             logger.warning("运行中拒绝行数探测失败，本轮跳过拒绝率维度")
             return None
 
+    def _error_distribution(self) -> dict[str, int]:
+        """按错误码聚合错误行数（FR-33）。
+
+        ``validation_errors`` 列里存的**不是**一个错误码，而是引擎写下的 JSON
+        数组，真实形态是 ``[{"error_message":"USER_NAME_REGEX","field_name":"user_name"}]``
+        （2026-10-16 在真实 Doris 上实测确认）。``error_message`` 才是规则声明里的
+        ``error_code``——它经 ``custom_message`` 传下去。把整串 JSON 当键，报告就
+        退化成一句没人能念出来的话，「该去改哪条规则」这个唯一有行动指向的信息
+        就丢掉了。
+
+        一行命中多条规则时只记首条：``error_dist`` 各项之和必须等于拒绝行数，
+        否则「按原因看拒绝量」会给人一个偏大的总数。
+        """
+        rows = self._execute(
+            f"SELECT validation_errors, COUNT(*) FROM {self._table(self.errors)} "
+            "GROUP BY validation_errors"
+        )
+        distribution: dict[str, int] = {}
+        for raw, count in rows:
+            key = _error_code(raw)
+            distribution[key] = distribution.get(key, 0) + int(count)
+        return distribution
+
     def report(
         self, *, source_rows: int, budget: dict[str, Any], with_quality_rules: bool
     ) -> QualityReport:
@@ -281,11 +331,34 @@ class DorisPublisher:
             rejected,
             ratio,
             self.errors if with_quality_rules else None,
+            self._error_distribution() if with_quality_rules else {},
         )
 
     def publish(self) -> None:
-        # swap=true 会把旧正式表保留在影子表名下，供 T-18 受管回滚使用。
+        # swap=true 会把旧正式表保留在影子表名下：它既是回滚的退路，也是
+        # 「影子表名下现在是谁的数据」这个问题的答案来源。
         self._execute(
             f"ALTER TABLE {self._table(self.formal)} REPLACE WITH TABLE "
             f"{_identifier(self.shadow)} PROPERTIES('swap'='true')"
         )
+
+    def discard_shadow(self) -> list[str]:
+        """丢弃未发布的影子表残留并释放其存储（FR-38 受管回滚的执行体）。
+
+        **只删由本运行命令确定的那两个名字**——目标库、正式表、影子表都来自
+        已冻结版本与已批准的准备单，不接受调用方指定的任何目标；``_identifier``
+        在构造期已把名字钉在受管标识符规则内，``formal == shadow`` 也已被拒。
+
+        先删派生错误表再删影子表：反过来的话，中途失败会留下「影子表还在、
+        它的错误表已经没了」的半截状态，而错误表是从影子表名派生的，重跑时
+        第二次调用仍能收敛（两次删除都是 ``IF EXISTS``）。
+
+        表不存在不是错误——运行可能在建表之前就失败了，此时无事可做正是正确结论。
+        """
+        dropped: list[str] = []
+        for name in (self.errors, self.shadow):
+            if not self._exists(name):
+                continue
+            self._execute(f"DROP TABLE IF EXISTS {self._table(name)}")
+            dropped.append(name)
+        return dropped
