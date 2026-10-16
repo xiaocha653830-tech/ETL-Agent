@@ -142,7 +142,7 @@ cd api && ./.venv/bin/python -m pytest              # Linux / macOS
 - ✅ **T-18 受管回滚**：回滚执行准备单里已批准的那份方案（`discard-shadow`），`POST /runs/{id}/rollback`（API-10）；换表后影子表名下已是被换下来的旧正式表，此时拒绝清理
 - ✅ **T-19 维护任务**：超时回收（投递重试耗尽或事件缺失）、审批过期级联终止、租约过期回收重排（有副作用记录的一律收敛为失败）；`maintenance.sweep` 已入 Beat 调度
 - ✅ **T-20 证据账本**：哈希链落库（`seq` 递增 + `prev_hash` 链接 + 创世哈希）、Ed25519 签名检查点（每 100 条或每 5 分钟锚定链头）、校验器（**启动时 + Beat 每 5 分钟巡检**，篡改可检出且能报出首个失败位置）、自包含审计报告（内嵌复算配方与公钥，可离线验证）与三个只读接口（API-11~13）。关键事件（Prepare / Approve / Commit / 执行 / 回滚）全覆盖，被拒的审批尝试同样留痕
-- ⬜ **T-21 Benchmark**：版本化评测集与准确率大盘尚未实现
+- 🟨 **T-21 Benchmark**：已实现版本化 v1 评测集、L0/L2 生成评测、三项指标与逐例明细、结果落库、触发/历史/详情接口及 CLI。L0 自检为 8/8 场景通过、算子/属性各 7/7、高危拒绝 5/5；这些数字不代表真实模型准确率。L1、前端大盘与更大样本验收待补齐
 - 🟨 **T-22 前端**：已有 `.pen` 设计和 HTML 静态原型，Vue 业务前端与接口联调未完成
 - ⬜ **T-23 全链路验收**：未完成；任务依赖与后续顺序见 [`SPEC §10`](docs/SPEC-ETL-Agent-v1.0.md#10-任务分解清单)
 
@@ -164,8 +164,8 @@ cd api && ./.venv/bin/python -m pytest              # Linux / macOS
 错误表 0 行，而运行状态仍是 `succeeded`。演示脚本现在带一道**提交后回读校验**，
 把这条只发生过一次的教训变成每次都会执行的检查。
 
-**测试记录（2026-10-16）**：最新完整复跑为 **458 个用例全部通过**（`ruff check app tests` 干净；
-迁移经 `alembic upgrade`/`downgrade` 往返与 `alembic check` 零差异验证）。
+**测试记录（2026-10-16）**：T-21 完整回归为 **501 个用例全部通过**（新增 42 项评测测试；`ruff check app tests` 干净；
+新增 `benchmark_runs` 迁移已应用，`alembic check` 零差异）。
 此前预算中断时运行行 `read_rows` 未更新的问题已通过调整轮询顺序修复；T-18 回滚、T-19 维护回收、
 质量报告与根因诊断的回归用例分别见 `api/tests/test_rollback.py`、`test_maintenance.py`、
 `test_quality_report.py` 与 `test_diagnosis.py`。
@@ -177,7 +177,28 @@ cd api && ./.venv/bin/python -m pytest              # Linux / macOS
 不支持的质量规则会阻止执行；预算度量缺失时对应维度不可判定，不能据此宣称五维监督已验收。
 固定方案种子与演示账号双审仅用于技术验证，不替代真实模型生成与独立人员审批。
 
-**下一步**：推进 T-21 Benchmark 与 T-22 前端及后端接口的联调 → T-23 全链路验收。
+**T-21 使用方式**（不改 `.env`，不启动任何数据作业）：
+
+```bash
+cd api
+python -m app.scripts.run_benchmark --dataset v1     # 默认 L0，不调用真实模型、不依赖数据库
+python -m app.scripts.run_benchmark --dataset v1 --backend deepseek  # 显式 L2，会消耗额度
+# 如需将 CLI 结果保存到数据库：先 alembic upgrade head，再添加 --persist
+```
+
+`POST /api/v1/benchmark/runs` 默认 `{ "dataset_version": "v1", "backend": "injected" }`，
+需要至少一个项目的工程师角色；`GET /benchmark/runs` 与 `GET /benchmark/runs/{id}`
+供已登录用户读取平台级合成评测结果。报告包含分母、阈值、数据集 SHA256 和真实模型标记；
+算子在册不等于选择正确，空集和全拒绝策略也不会被判为通过。
+指标定义、策略夹具边界及小样本限制见 [`评测集 v1`](api/benchmarks/v1/README.md)。
+
+**T-21 首轮 L2 实测（2026-10-16）**：配置模型 `deepseek-chat`，耗时 42.109 秒，
+算子 7/7、属性 7/7，隔离 PDP 高危拒绝 5/5，合法放行对照通过；8 个场景中 7 个通过。
+`gen-08` 要求明确拒绝 Kafka 接入，实际进入澄清，因此行为检查失败、总报告 `passed=false`。
+低分/失败报告同样已落库：`49636d43-72a2-40ec-a5bf-4a319258496a`。
+这只是 v1 小样本上的真实生成成绩；策略夹具通过不代表生产授权全链路已验收。
+
+**下一步**：处理不支持需求的澄清/拒绝边界、扩充评测集并补 L1 → T-22 前端接口联调 → T-23 全链路验收。
 证据账本（T-20）已完成；需注意 `tool_broker` 的留痕接口虽已补成真落库
 （`LedgerInvocationSink`），但 **Broker 目前仍没有注册任何真实工具**，
 所以 `tool.invoked` 是「接口就位」而非「已在产生记录」。

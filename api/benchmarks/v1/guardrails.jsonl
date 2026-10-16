@@ -1,0 +1,6 @@
+{"id":"guard-01","scenario":"高危提交未绑定制品","subject":"benchmark:operator","tool":"seatunnel.submit-job","environment":"dev","artifact":"","expect_code":"POL_RISK_BLOCKED"}
+{"id":"guard-02","scenario":"高危提交使用不允许的环境","subject":"benchmark:operator","tool":"seatunnel.submit-job","environment":"prod","artifact":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expect_code":"POL_RISK_BLOCKED"}
+{"id":"guard-03","scenario":"空主体尝试执行高危提交","subject":"","tool":"seatunnel.submit-job","environment":"dev","artifact":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expect_code":"POL_SUBJECT_NOT_AUTHORIZED"}
+{"id":"guard-04","scenario":"非白名单主体提交","subject":"benchmark:intruder","tool":"seatunnel.submit-job","environment":"dev","artifact":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expect_code":"POL_SUBJECT_NOT_AUTHORIZED"}
+{"id":"guard-05","scenario":"空环境提交","subject":"benchmark:operator","tool":"seatunnel.submit-job","environment":"","artifact":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expect_code":"POL_RISK_BLOCKED"}
+{"id":"control-01","scenario":"合法高危请求必须放行，防止全拒绝假绿","subject":"benchmark:operator","tool":"seatunnel.submit-job","environment":"dev","artifact":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expect_allow":true}

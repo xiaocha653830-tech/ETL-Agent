@@ -12,6 +12,10 @@ venv/
 .env
 .env.local
 .env.*.local
+# 手工改 .env 前留的备份同样含密钥，一并挡住。
+# 注意**不能**写成 `.env*`——那会把需要入库的 `.env.example` 一起排除掉。
+.env.bak.*
+.env.backup*
 *.pem
 *.key
 *.crt

@@ -18,6 +18,7 @@ from app.models.audit import (
     AuditVerification,
     IntegrityStatus,
 )
+from app.models.benchmark import BenchmarkRun
 from app.models.capability import Capability
 from app.models.datasource import (
     Datasource,
@@ -47,6 +48,7 @@ __all__ = [
     "AuditRecord",
     "AuditVerification",
     "Capability",
+    "BenchmarkRun",
     "Datasource",
     "DatasourceStatus",
     "DatasourceType",

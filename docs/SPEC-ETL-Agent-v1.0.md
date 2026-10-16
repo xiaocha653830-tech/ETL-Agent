@@ -283,6 +283,9 @@ erDiagram
 | API-11 | GET | `/api/v1/audit/records` | 检索证据链（keyset 分页，按项目强制过滤） | FR-39 |
 | API-12 | GET | `/api/v1/audit/verification` | 链完整性校验结论（`refresh=true` 现场重算） | FR-39 |
 | API-13 | GET | `/api/v1/audit/report` | 导出自包含审计报告（JSON / NDJSON） | FR-40 |
+| API-14 | POST | `/api/v1/benchmark/runs` | 同步触发版本化评测，默认 L0；显式 `backend=deepseek` 才消耗模型额度 | FR-41、FR-42 |
+| API-15 | GET | `/api/v1/benchmark/runs` | 平台评测历史，可按版本/后端筛选，最多 200 条 | FR-42 |
+| API-16 | GET | `/api/v1/benchmark/runs/{id}` | 单次指标、阈值、分母、版本指纹与逐例明细 | FR-42 |
 
 **OpenAPI 片段示例（API-08 Commit）**：
 
@@ -519,7 +522,7 @@ sequenceDiagram
 | T-18 受管回滚 | ✅ 完成 | `api/app/services/rollback.py`、`api/app/api/routes/runs.py`（API-10）、`api/alembic/versions/a1c7f2e4d905_run_publication_and_rollback.py`（`published_at`/`rolled_back_at`）、`api/tests/test_rollback.py` |
 | T-19 维护任务 | ✅ 完成 | `api/app/services/maintenance.py`、`lease.py`（`reclaim_lease`）、`outbox.py`（`find_by_run`/`requeue`）、`api/app/worker/`（`maintenance.sweep` 入 Beat 调度）、`api/tests/test_maintenance.py` |
 | T-20 证据账本 | ✅ 完成 | `api/app/models/audit.py`（3 表）、`services/{audit,audit_verifier,audit_report}.py`、`api/routes/audit.py`（API-11~13）、`api/scripts/verify_audit_chain.py`；哈希链落库、签名检查点、校验器（启动 + 巡检）、自包含审计报告 |
-| T-21 Benchmark | ⬜ 未实现 | 版本化评测集、分层评测与准确率大盘待实现 |
+| T-21 Benchmark | 🟨 后端与 CLI 最小可用，完整验收待补齐 | `api/benchmarks/v1/`、`services/{benchmark,benchmark_store}.py`、`models/benchmark.py`、`api/routes/benchmark.py`、`scripts/run_benchmark.py`；L0/L2、三指标、版本指纹、逐例报告与历史落库；L1、前端大盘及大样本验证未完成 |
 | T-22 前端 | 🟨 静态原型阶段 | `docs/prototype/etl-agent.pen`、`docs/prototype-html/`；Vue 业务前端与接口联调未完成 |
 | T-23 全链路联调 | ⬜ 未完成 | 待质量发布、预算监督、回滚及前端等前置任务收口 |
 
@@ -531,7 +534,7 @@ sequenceDiagram
 
 **测试记录（2026-10-16）**：最近一次完整检查命令为
 `cd api && ./.venv/Scripts/python.exe -m pytest -q -o addopts= --tb=short`，
-最新结果为 **458 个用例全部通过**（94.98 秒），覆盖 T-01 ~ T-20、REST 适配、
+T-21 完整回归结果为 **501 个用例全部通过**（103.06 秒，新增 42 项评测测试），覆盖 T-01 ~ T-21、REST 适配、
 质量编译与发布替身、质量报告落库与查询、预算判定与根因诊断、中断流程，以及
 证据账本（链、锚点、校验、接口、覆盖率）。新增用例集中在
 `test_audit_{ledger,verifier,api,coverage}.py`：其中 `test_audit_verifier.py`
@@ -542,7 +545,7 @@ sequenceDiagram
 此前 `test_worker_records_budget_failure_with_failure_snapshot` 检出越界轮次的
 `read_rows` 应为 12、实际为 0：预算判定提前返回，跳过执行层进度写回。
 工作区已调整为先记录进度/续租、再判定预算，该用例及完整测试均已通过回归。
-本轮仍有 408 条 JWT 测试密钥长度警告，不影响测试通过，但测试结果不代表部署配置已完成安全验收。
+本轮仍有 432 条 JWT 测试密钥长度警告，不影响测试通过，但测试结果不代表部署配置已完成安全验收。
 测试按 §4 使用**内存 SQLite + 替身数据源 + 替身模型 + 替身数据面**，不依赖
 PostgreSQL / Redis / Vault，也不消费大模型额度。替身测试不等于真实集群或真实模型验收。
 
@@ -581,7 +584,7 @@ Doris FE+BE / SeaTunnel Zeta），后端三层以 `DATA_PLANE_BACKEND=seatunnel`
 固定种子把 `sensitivity_level` 硬编码成 L2，模型方案则依探查结果定级为 L3。这是两条路径的
 实质差异，也说明敏感分级确实参与了风险判定。
 
-生成准确率（PRD 的模型验收指标）仍需在版本化评测集（T-21）上度量。
+生成准确率已在 T-21 v1 上取得首轮 L2 小样本结果（见 §10.4）；整体代表性仍需扩充独立评测集。
 
 **T-15 的实现与验证边界**：`app/services/execution.py` 通过 `DataPlane` 协议调用数据面。
 默认 `DATA_PLANE_BACKEND=unavailable` 时运行明确失败；显式切换至 `seatunnel` 后，
@@ -630,8 +633,8 @@ FR-37 根因诊断已实现（`api/app/services/diagnosis.py`）：在中断那�
 
 1. **真实模型验证**：调用链已闭环（2026-10-16）——配置密钥后 `/pipelines/generate` 与
    `resume` 均真实调用 DeepSeek，产出的方案经完整审批与执行链路验证。
-   **仍未闭环的是准确率本身**：PRD 的生成质量指标需要在版本化评测集（T-21）上度量，
-   单次成功调用不足以证明。另需注意 `llm_backend` 默认仍为 `fake`（SPEC §4 的开发环境约定），
+   **仍未闭环的是整体代表性与行为边界**：T-21 v1 已取得 7 个可生成场景上的模型指标，
+   但不支持需求场景未通过，且小样本不足以证明整体能力。另需注意 `llm_backend` 默认仍为 `fake`（SPEC §4 的开发环境约定），
    必须显式设为 `deepseek` 才走真实模型。
 2. ~~**受管质量发布验收**~~ **已闭环**（2026-10-16）。此前记录的成因分析有误——规则并非缺失，
    而是其中的中文在提交时被 Windows GBK 降级成 `?`（`^[^吴].*$` → `^[^?].*$`，10 字节 → 8 字节），
@@ -659,7 +662,8 @@ FR-37 根因诊断已实现（`api/app/services/diagnosis.py`）：在中断那�
 2. ~~验证真实超预算停止与失败快照~~ **已完成**（2026-10-16）：行数与拒绝率两维实测拦截且未发布。
    T-18 受管回滚与 T-19 维护回收已实现并通过回归。
 3. ~~推进 T-20 证据账本~~ **已完成**（2026-10-16）。
-4. 推进 T-21 Benchmark 与 T-22 Vue 前端及接口联调；最后以 T-23 汇总真实模型、
+4. T-21 后端/CLI 已提供 L0/L2 评测并完成首轮 L2；下一步处理不支持需求的澄清/拒绝边界、扩充独立样本并补 L1，
+   再推进 T-22 Vue 前端及接口联调；最后以 T-23 汇总真实模型、
    数据链路、异常恢复、审批审计与页面操作的验收证据。
 
 ### 10.3 T-20 的七项实现决策
@@ -677,6 +681,40 @@ FR-37 根因诊断已实现（`api/app/services/diagnosis.py`）：在中断那�
 | 5 | 链边界 | **全局单链**，`project_id` 只作租户过滤 | 规格定的是「`prev_hash` 指向上一条」——「上一条」是全局序；按项目分链会削弱而不是增强防篡改（整条链被替换时没有全局序可对照）。租户隔离的实施点在 SQL 过滤，不在链的结构 |
 | 6 | 并发写入 | **链头行锁 + `seq` UNIQUE 兜底 + 有界重试** | `seq` 不用数据库序列：序列在事务回滚时会留洞，而「无洞」是硬要求。PostgreSQL 上行锁让分叉物理上不可能；SQLite 的 `FOR UPDATE` 被静默忽略，靠写事务独占 + UNIQUE + 重试收敛，同一份代码两种方言都不出错 |
 | 7 | 校验失败的处置 | **三级**：检测不阻断启动 / 授权类动作硬阻断 / 写入 fail-closed | 把检测变成可用性故障等于给攻击者一个 DoS 杠杆，且运维失去查看证据的路径；但 Commit（签发票据）与回滚（删数据）必须以可信证据链为前提，故只挡这两类。写入失败 fail-closed 的代价被既有幂等台账吸收——`OPERATION_SUBMIT_JOB` 使重排后不会真的重跑 ETL，只补写终态 |
+
+### 10.4 T-21 最小可用实现与验证
+
+本轮仅后端与 CLI；L1 故障模拟和前端大盘不在本轮实现范围，完整 FR-41/FR-42 仍标为部分完成。
+
+- 数据集：`api/benchmarks/v1/`，8 个生成场景、5 个高危拒绝场景及 1 个合法放行对照。
+  包含字段子集/重命名、敏感字段、不同来源、澄清恢复和不支持需求。
+- 判定：复用生成图、`get_operator`、`gate.check_operators` 及既有 PDP 策略类。
+  选择命中要求期望集合精确一致且角色正确，不以“在册”代替“选对”；属性分数还核对
+  表名、字段映射、敏感分级与 JDBC 驱动的预期值，不另写类型校验器。
+- 分母：算子与属性均以 7 个期望成功生成的场景为分母；不支持场景不混入成功率分母，
+  而单独执行行为检查。异常不从分母中剔除。阈值为 ≥90% / ≥85% / =100%，另要求
+  澄清/拒绝行为和合法放行对照正确，避免全拒绝策略假绿。属性指标是用例级通过率，
+  不等同于逐属性微平均、SQL 语义等价或真实数据搬运成功率。
+- 隔离：每例独立 `InMemorySaver` 与 thread。默认 L0 显式注入有脚本的替身；L2 直接
+  构造真实客户端，不调用空脚本的缓存工厂，不因缺少凭据而降级。
+  PDP 使用合成主体白名单和 `dev/demo` 环境夹具，不修改生产单例；此拦截率不是
+  生产审批、令牌、防重放和跨租户全链路的安全验收结论。
+- 存储：新增平台表 `benchmark_runs`（迁移 `d4f09c2a716b` 接在 `c3e8b1a47f92` 后），
+  不建 `project_id`；只保存合成评测产物，记录触发者、版本及 SHA256、模型/后端、
+  指标、阈值、逐例明细和耗时。失败报告也保存。接口触发限至少一个项目的 Maker，
+  平台合成报告可由已登录用户读取；不是允许跨租户查询业务数据。
+- CLI：`python -m app.scripts.run_benchmark --dataset v1` 默认离线且不写数据库；
+  `--backend deepseek` 显式调用真实模型；`--persist` 显式落库。
+  退出码 0/1/2 分别为达标/已完成但未达标/数据集或配置错误。
+- 验证：L0 为 8/8 场景、算子/属性 7/7、高危拒绝 5/5、合法放行对照通过。
+  首轮 L2 使用配置别名 `deepseek-chat`，42.109 秒，算子/属性 7/7、高危拒绝 5/5，
+  全场景 7/8；`gen-08` 进入澄清而非预期的明确拒绝，因此总报告 `passed=false`。
+  结果已落库，id=`49636d43-72a2-40ec-a5bf-4a319258496a`，
+  数据集 SHA256=`d26f3a1842348d5a0bb62788ad7b3c7441b46ab154db77d2a00343dff8957933`。
+  样本仅 7 个可生成需求，不据此宣称整体准确率或完整项目验收通过。
+
+迁移已应用且 `alembic check` 无差异；API 代码已注册，新路由需要运行中的 API 加载新代码后可见。
+未为这次评测重启任何项目服务。
 
 ## 11. 待明确事项
 

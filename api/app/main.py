@@ -16,6 +16,7 @@ from app.api.routes import (
     approvals,
     audit,
     auth,
+    benchmark,
     commits,
     datasources,
     health,
@@ -92,3 +93,4 @@ app.include_router(runs.router, prefix=API_V1)
 app.include_router(registry_router, prefix=API_V1)
 # M11 审计与证据账本：检索事件链、校验链完整性、导出审计报告（API-11 ~ API-13）
 app.include_router(audit.router, prefix=API_V1)
+app.include_router(benchmark.router, prefix=API_V1)
