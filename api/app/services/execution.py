@@ -19,6 +19,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from typing import Any, Protocol
 
 from sqlalchemy import select, update
@@ -27,7 +28,10 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.errors import (
+    DataplaneJobFailed,
+    DataplaneProtocolError,
     DataplaneUnavailable,
+    ErrorCode,
     LeaseLost,
     ResourceConflict,
     ResourceNotFound,
@@ -55,6 +59,7 @@ EVENT_FAILED = "run.failed"
 EVENT_CANCELLED = "run.cancelled"
 EVENT_CANCEL_REQUESTED = "run.cancel_requested"
 EVENT_PROGRESS = "run.progress"
+EVENT_BUDGET_EXCEEDED = "run.budget_exceeded"
 
 # 幂等台账的键：向数据面提交作业
 OPERATION_SUBMIT_JOB = "data-plane.submit-job"
@@ -170,10 +175,76 @@ class ExecutionOutcome:
     detail: dict[str, Any] | None = None
 
 
+class PollAction(StrEnum):
+    """轮询结论的动作位。"""
+
+    CONTINUE = "continue"
+    CANCEL = "cancel"
+    BUDGET_EXCEEDED = "budget_exceeded"
+
+
+@dataclass(frozen=True)
+class PollDecision:
+    """轮询回调的结论（FR-29 取消 / FR-36 超预算硬中断）。
+
+    **回调只表达「该不该停、为什么停」，停止作业本身由适配器执行**——jobId
+    只有适配器持有，控制面既没有这个句柄，也不该有。把「判定」与「执行停止」
+    分开，超预算的判据才可以脱离 SeaTunnel 单独测试。
+
+    ``snapshot`` 由判定方填好、执行层原样落库：它是快照而不是状态，
+    中间任何一层「顺手加工」都会让证据链失真。
+    """
+
+    action: PollAction
+    reason: str | None = None
+    snapshot: dict[str, Any] | None = None
+
+    @classmethod
+    def proceed(cls) -> "PollDecision":
+        return cls(PollAction.CONTINUE)
+
+    @classmethod
+    def cancel(cls) -> "PollDecision":
+        return cls(PollAction.CANCEL, reason="收到取消请求")
+
+    @classmethod
+    def budget_exceeded(
+        cls, *, reason: str, snapshot: dict[str, Any]
+    ) -> "PollDecision":
+        return cls(PollAction.BUDGET_EXCEEDED, reason=reason, snapshot=snapshot)
+
+
+PollCallback = Callable[[str, dict[str, Any]], PollDecision]
+
+
 class DataPlane(Protocol):
     """数据面适配器协议 —— M8 只依赖这个形状，不依赖 SeaTunnel。"""
 
-    def submit(self, command: ExecutionCommand) -> ExecutionOutcome: ...
+    def submit(
+        self,
+        command: ExecutionCommand,
+        *,
+        db: Session,
+        on_poll: PollCallback,
+    ) -> ExecutionOutcome: ...
+
+
+class DataplaneCancelled(Exception):
+    """数据面确认已接收停止命令后通知执行层落取消终态。"""
+
+
+class BudgetExceeded(Exception):
+    """FR-36：超预算硬中断。
+
+    **由适配器在确认已请求停止作业之后抛出**，因此执行层接到它时，数据面上
+    已经没有作业在写了。之所以携带快照，是因为终态事件需要如实回答「中断
+    那一刻越到了什么程度」——这个观测只在判定现场存在，事后再也拿不回来。
+    """
+
+    def __init__(self, *, reason: str, snapshot: dict[str, Any]) -> None:
+        self.reason = reason
+        self.snapshot = snapshot
+        super().__init__(reason)
 
 
 class UnavailableDataPlane:
@@ -183,14 +254,28 @@ class UnavailableDataPlane:
     一个假装跑通了的运行比一个明确失败的运行危险得多。
     """
 
-    def submit(self, command: ExecutionCommand) -> ExecutionOutcome:
+    def submit(
+        self,
+        command: ExecutionCommand,
+        *,
+        db: Session,
+        on_poll: PollCallback,
+    ) -> ExecutionOutcome:
         raise DataplaneUnavailable("数据面适配器尚未接通（见 T-15）")
 
 
-_data_plane: DataPlane = UnavailableDataPlane()
+_data_plane: DataPlane | None = None
 
 
 def get_data_plane() -> DataPlane:
+    global _data_plane
+    if _data_plane is None:
+        if settings.data_plane_backend == "seatunnel":
+            from app.services.seatunnel import SeaTunnelDataPlane
+
+            _data_plane = SeaTunnelDataPlane()
+        else:
+            _data_plane = UnavailableDataPlane()
     return _data_plane
 
 
@@ -206,6 +291,7 @@ def submit_job_once(
     run_id: uuid.UUID,
     command: ExecutionCommand,
     plane: DataPlane,
+    on_poll: PollCallback | None = None,
 ) -> ExecutionOutcome | None:
     """把「向数据面提交作业」做成至多一次（FR-27）。
 
@@ -216,7 +302,13 @@ def submit_job_once(
         db,
         run_id=run_id,
         operation_key=OPERATION_SUBMIT_JOB,
-        action=lambda: _as_projection(plane.submit(command)),
+        action=lambda: _as_projection(
+            plane.submit(
+                command,
+                db=db,
+                on_poll=on_poll or (lambda _status, _metrics: PollDecision.proceed()),
+            )
+        ),
     )
     if outcome.executed:
         return _from_projection(outcome.value or {})
@@ -339,6 +431,42 @@ def mark_cancelled(
         status=ExecutionRunStatus.CANCELLED,
         error=None,
     )
+
+
+def mark_budget_exceeded(
+    db: Session,
+    run: ExecutionRun,
+    *,
+    reason: str,
+    snapshot: dict[str, Any],
+    worker_id: uuid.UUID,
+) -> ExecutionRun:
+    """超预算硬中断的终态与失败快照（FR-36）。
+
+    **失败快照与终态分成两条事件**，与 ``mark_succeeded`` 之后的度量事件同构：
+    终态事件回答「结果是什么」，快照事件回答「中断时观测到什么」。挤在一条里
+    会让两者互相截断——终态文案有 512 字符上限，而快照是结构化数据。
+
+    运行行上的 ``read_rows`` / ``written_bytes`` 保留着中断前的最后一次进度，
+    所以「跑到哪一步被拦下」在运行列表里就能看见，不必翻事件。
+    """
+    finished = _finish(
+        db,
+        run,
+        worker_id=worker_id,
+        event_type=EVENT_FAILED,
+        message=reason[:512],
+        status=ExecutionRunStatus.FAILED,
+        error=f"{ErrorCode.BIZ_BUDGET_EXCEEDED.value}: {reason}"[:512],
+    )
+    record_event(
+        db,
+        finished,
+        EVENT_BUDGET_EXCEEDED,
+        message="超预算硬中断，已保存失败快照",
+        output_snapshot=snapshot,
+    )
+    return finished
 
 
 # --------------------------------------------------------------------------
@@ -520,8 +648,41 @@ def run_execution(
         if on_event is not None:
             on_event(EVENT_SUBMITTED)
 
+        last_progress: tuple[str, int, int] | None = None
+
+        def on_poll(job_status: str, metrics: dict[str, Any]) -> PollDecision:
+            nonlocal last_progress
+            # 长作业必须续租；取消请求也只有轮询时才能安全地交给 SeaTunnel 停止。
+            renew_lease(db, run_id=run.id, worker_id=worker_id)
+            current = (
+                job_status,
+                int(metrics.get("SourceReceivedCount") or 0),
+                int(metrics.get("SinkCommittedBytes") or metrics.get("SinkWriteBytes") or 0),
+            )
+            if current != last_progress:
+                if not fenced_update(
+                    db,
+                    run_id=run.id,
+                    worker_id=worker_id,
+                    values={"read_rows": current[1], "written_bytes": current[2]},
+                ):
+                    raise LeaseLost("数据面进度写入时已失去运行租约")
+                record_event(
+                    db, run, EVENT_PROGRESS, message=f"数据面状态：{job_status}",
+                    metrics={"read_rows": current[1], "written_bytes": current[2]},
+                    output_snapshot={"job_id": metrics.get("jobId")}
+                    if metrics.get("jobId") is not None else None,
+                )
+                last_progress = current
+            return (
+                PollDecision.cancel()
+                if cancel_requested(db, run)
+                else PollDecision.proceed()
+            )
+
         outcome = submit_job_once(
-            db, run_id=run.id, command=command, plane=plane or get_data_plane()
+            db, run_id=run.id, command=command, plane=plane or get_data_plane(),
+            on_poll=on_poll,
         )
         if outcome is None:
             # 此前已尝试过提交且没有可用结论：不重复提交，交给人工核对目标端残留
@@ -531,8 +692,21 @@ def run_execution(
                 f"{OPERATION_SUBMIT_JOB} 此前已尝试过且结论不明，不自动重放",
                 worker_id=worker_id,
             )
+    except DataplaneCancelled:
+        return mark_cancelled(db, run, worker_id=worker_id, reason="数据面作业已停止")
+    except BudgetExceeded as exc:
+        # 适配器已确认停止作业，这里只负责把「为什么停」完整留痕（FR-36）
+        return mark_budget_exceeded(
+            db,
+            run,
+            reason=exc.reason,
+            snapshot=exc.snapshot,
+            worker_id=worker_id,
+        )
     except DataplaneUnavailable as exc:
         # 数据面不可达是可预期的运维状态，用分类文案而不是异常原文
+        return mark_failed(db, run, f"{exc.code.value}: {exc.message}", worker_id=worker_id)
+    except (DataplaneJobFailed, DataplaneProtocolError) as exc:
         return mark_failed(db, run, f"{exc.code.value}: {exc.message}", worker_id=worker_id)
     except LeaseLost:
         logger.warning("运行已失去租约，放弃推进 run=%s", run.id)

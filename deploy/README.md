@@ -97,28 +97,11 @@ ls seatunnel/apache-seatunnel-2.3.13/connectors/ | grep -E "doris|jdbc"
 
 ---
 
-## 四、运行示例作业
+## 四、运行模式
 
-**第一步：启动 Zeta 集群**（常驻进程，cluster 模式必需；Local 模式无需但也不可用）：
-
-```bash
-cd seatunnel/apache-seatunnel-2.3.13
-./bin/seatunnel-cluster.sh -d         # 后台启动单节点集群（master + worker 同节点）
-```
-
-**第二步：提交作业**
-
-```bash
-./bin/seatunnel.sh --config ../../deploy/seatunnel/mysql-to-doris.conf -m cluster
-```
-
-**必须用 `-m cluster`**：Local 模式不支持作业列表与状态查询，无法满足 FR-30 的状态回传（见 SPEC ADR-07）。
-作业提交后可用 REST API 查询：
-
-```bash
-curl http://127.0.0.1:8080/hazelcast/rest/maps/running-jobs
-curl "http://127.0.0.1:8080/hazelcast/rest/maps/job-info/<jobId>"
-```
+T-15 控制面使用 **Zeta 集群模式 + REST V2**，启动与接入方法见第七节。
+现有 `run-in-docker.sh` 是独立的 Local 模式连接器诊断脚本；其作业无法由控制面
+通过 REST 查询或取消，不能作为 T-15 验收结果。
 
 ---
 
@@ -156,3 +139,27 @@ FE 返回的是 BE 的**容器 IP**，而宿主机路由不到它 —— 因此*
 | 容器 → 容器（FE ↔ BE） | ✅ |
 
 **结论**：数据面组件（SeaTunnel）必须与 Doris **同处一个 Docker 网络**，不能跑在宿主机上。落地方式见 `deploy/seatunnel/run-in-docker.sh`（以 `--network doris_doris-net` 加入 Doris 所在网络）。
+
+## 七、T-15 REST 适配器联调
+
+`run-in-docker.sh` 是一次性 **Local 模式**作业，仅用于连接器/网络诊断；控制面
+T-15 使用常驻 Zeta 集群和 REST V2。先启动 Doris，再启动集群：
+
+```bash
+docker compose -f deploy/doris/docker-compose.yml up -d
+docker compose -f deploy/seatunnel-zeta.compose.yml up -d
+curl http://127.0.0.1:8080/overview
+```
+
+Worker 的 `.env` 设 `DATA_PLANE_BACKEND=seatunnel`。Worker 在宿主机运行时设置
+`SEATUNNEL_BASE_URL=http://127.0.0.1:8080`；若 Worker 也在 `doris_doris-net`，
+设置为 `http://etl-seatunnel-zeta:8080`。登记的源端地址必须可从 SeaTunnel **容器**
+访问（本机 MySQL 可用 `host.docker.internal`），Doris FE 地址应使用同网络中的
+`etl-doris-fe:8030`。本适配器只提交到准备单指定的影子表，T-16 才负责质量校验与发布。
+非 `dev`/`demo` 环境须将 SeaTunnel REST 配为 HTTPS；提交请求体包含运行时注入的凭据。
+API 与 Worker 还须共用同一凭据后端：使用 Vault，或共享 `LOCAL_SECRET_FILE` 指向的加密文件。
+T-16 前 `rejected_rows=0` 只是接口占位值，不代表数据质量校验通过。
+早期冻结版本若没有 `${TARGET_TABLE}` 与 `etl-${RUN_ID}` 运行时占位符，必须重新生成、
+冻结并审批；适配器会拒绝可能直写正式表的旧配置，不会修改已冻结版本。
+
+当前测试使用假 REST 传输；真实 Zeta + MySQL + Doris 的控制面端到端联调尚待执行。

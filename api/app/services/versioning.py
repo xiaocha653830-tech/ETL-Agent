@@ -18,8 +18,9 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.core.errors import ResourceConflict
+from app.core.errors import PermissionDenied, ResourceConflict
 from app.models.version import PipelineVersion, VersionStatus
+from app.schemas.pipeline import QualityRule
 from app.services.gate import GateReport
 
 logger = logging.getLogger(__name__)
@@ -136,6 +137,43 @@ def ensure_mutable(version: PipelineVersion) -> None:
     """写操作前的守卫 —— 冻结版本一律拒绝修改（FR-19）。"""
     if version.is_immutable:
         raise ResourceConflict("冻结版本不可修改")
+
+
+def set_quality_rules(
+    db: Session,
+    *,
+    version: PipelineVersion,
+    user_id: uuid.UUID,
+    rules: list[QualityRule],
+) -> PipelineVersion:
+    """工程师在冻结前显式声明质量契约（FR-32）。"""
+    if version.created_by != user_id:
+        raise PermissionDenied("只能编辑本人创建的方案版本")
+    if version.status is not VersionStatus.DRAFT:
+        raise ResourceConflict("只有草稿版本可以修改质量规则")
+
+    plan = dict(version.etl_plan or {})
+    target_fields = {
+        str(mapping.get("target_field"))
+        for mapping in plan.get("field_mappings") or []
+        if mapping.get("target_field")
+    }
+    unknown = sorted({rule.field for rule in rules if rule.field not in target_fields})
+    if unknown:
+        raise ResourceConflict(f"质量规则字段不在已审查的目标字段映射中：{'、'.join(unknown)}")
+
+    error_codes = [rule.error_code for rule in rules]
+    if len(error_codes) != len(set(error_codes)):
+        raise ResourceConflict("质量规则的错误码必须唯一")
+
+    snapshots = [rule.model_dump(mode="json") for rule in rules]
+    # 两处快照同步更新；指纹覆盖二者，冻结后审批看到的内容必须一致。
+    plan["quality_rules"] = snapshots
+    version.etl_plan = plan
+    version.quality_rules = snapshots
+    db.commit()
+    db.refresh(version)
+    return version
 
 
 # --------------------------------------------------------------------------

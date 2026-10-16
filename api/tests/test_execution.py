@@ -97,7 +97,7 @@ class _FakePlane:
         self._error = error
         self.commands: list = []
 
-    def submit(self, command):
+    def submit(self, command, *, db, on_poll):
         self.commands.append(command)
         if self._error is not None:
             raise self._error

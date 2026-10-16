@@ -59,6 +59,8 @@ def requires_plan_attribute(attribute_name: str) -> bool:
 
 def _render_value(attribute_name: str, value: Any, *, endpoint: str) -> str:
     """渲染单个属性值。"""
+    if value in ("${TARGET_TABLE}", "etl-${RUN_LABEL}"):
+        return f'"{value}"'
     if is_injected_attribute(attribute_name):
         # 占位符只表达“运行时从哪一端注入”，绝不复用模型给出的潜在敏感值。
         tail = attribute_name.rsplit(".", 1)[-1].upper()
@@ -71,6 +73,13 @@ def _render_value(attribute_name: str, value: Any, *, endpoint: str) -> str:
     if isinstance(value, list):
         items = ", ".join(f'"{item}"' for item in value)
         return f"[{items}]"
+    if isinstance(value, dict):
+        # SeaTunnel 的 doris.config 等 MAP 属性必须保留 HOCON 结构，不能字符串化。
+        items = ", ".join(
+            f"{key} = {_render_value(key, item, endpoint=endpoint)}"
+            for key, item in value.items()
+        )
+        return "{ " + items + " }"
     if value is None:
         return "null"
     return f'"{value}"'
@@ -115,9 +124,26 @@ def render_seatunnel_config(
     source_step = _pick_step(steps, "source")
     sink_step = _pick_step(steps, "sink")
 
+    if source_step.get("operator_id") == "seatunnel.source.Jdbc":
+        source_extra = {
+            "url": "${SOURCE_URL}",
+            "user": "${SOURCE_USER}",
+            "password": "${SOURCE_PASSWORD}",
+        }
+    else:
+        source_extra = {}
+
     if sink_step.get("operator_id") == _LABEL_PREFIX_OPERATOR:
         # 影子表写入需要全局唯一的导入标签；用 run_id 前缀同时满足幂等（FR-27）
-        extra = {"sink.label-prefix": f"etl-{run_id}"}
+        extra = {
+            "fenodes": "${TARGET_FENODES}",
+            "username": "${TARGET_USERNAME}",
+            "password": "${TARGET_PASSWORD}",
+            "sink.label-prefix": "etl-${RUN_LABEL}",
+            # 真正执行只能写准备单指定的影子表；模型填的正式表不可直达数据面。
+            "table": "${TARGET_TABLE}",
+            "doris.config": {"format": "json", "read_json_by_line": "true"},
+        }
     else:
         extra = {}
 
@@ -141,7 +167,9 @@ def render_seatunnel_config(
             "}",
             "",
             "source {",
-            _render_operator_block(source_step, endpoint="SOURCE"),
+            _render_operator_block(
+                source_step, endpoint="SOURCE", extra_attributes=source_extra
+            ),
             "}",
             "",
             "sink {",

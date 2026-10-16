@@ -179,7 +179,7 @@ def test_happy_path_produces_plan_and_config():
     config_text = result["config"]
     assert "Jdbc {" in config_text
     assert "Doris {" in config_text
-    assert 'table = "orders_wide"' in config_text
+    assert 'table = "${TARGET_TABLE}"' in config_text
 
 
 def test_config_never_contains_credentials():
@@ -190,7 +190,12 @@ def test_config_never_contains_credentials():
     config_text = result["config"]
     assert "jdbc:mysql://127.0.0.1:3306/demo" not in config_text
     assert "${SOURCE_URL}" in config_text
+    assert "${SOURCE_USER}" in config_text
+    assert "${SOURCE_PASSWORD}" in config_text
     assert "${TARGET_FENODES}" in config_text
+    assert "${TARGET_USERNAME}" in config_text
+    assert "${TARGET_PASSWORD}" in config_text
+    assert 'doris.config = { format = "json", read_json_by_line = "true" }' in config_text
 
 
 def test_doris_sink_gets_idempotent_label_prefix():
@@ -198,7 +203,7 @@ def test_doris_sink_gets_idempotent_label_prefix():
     graph = _graph([PARSE_OK, MATCH_OK, PLAN_OK])
     result = graph.invoke(_initial("run-abc"), _config())
 
-    assert "etl-run-abc" in result["config"]
+    assert 'sink.label-prefix = "etl-${RUN_LABEL}"' in result["config"]
 
 
 def test_field_mappings_carry_sensitivity_level():

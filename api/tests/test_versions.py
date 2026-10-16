@@ -184,6 +184,104 @@ def test_freeze_produces_fingerprint(client: TestClient, ctx, stubs):
     assert body["gate_report"]["summary"]["failed"] == 0
 
 
+def test_maker_declares_quality_rules_before_freeze(client: TestClient, ctx, stubs):
+    from app.services.versioning import compute_fingerprint
+
+    _generate(client, ctx, [PARSE_OK, MATCH_OK, PLAN_V1], stubs)
+    version_id = _versions(client, ctx)[0]["id"]
+    rules = [{
+        "field": "order_id",
+        "rule": "not_null",
+        "params": {},
+        "error_code": "ORDER_ID_REQUIRED",
+        "action": "reject",
+    }]
+
+    updated = client.put(
+        f"/api/v1/versions/{version_id}/quality-rules",
+        json={"rules": rules},
+        headers=ctx["headers"],
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["quality_rules"] == rules
+    assert updated.json()["etl_plan"]["quality_rules"] == rules
+
+    frozen = client.post(
+        f"/api/v1/versions/{version_id}/freeze", headers=ctx["headers"]
+    )
+    assert frozen.status_code == 200, frozen.text
+    body = frozen.json()
+    assert body["sha256"] == compute_fingerprint(
+        body["etl_plan"], body["config"], body["quality_rules"]
+    )
+
+
+def test_quality_rules_cannot_change_frozen_version(client: TestClient, ctx, stubs):
+    _generate(client, ctx, [PARSE_OK, MATCH_OK, PLAN_V1], stubs)
+    version_id = _versions(client, ctx)[0]["id"]
+    client.post(f"/api/v1/versions/{version_id}/freeze", headers=ctx["headers"])
+
+    response = client.put(
+        f"/api/v1/versions/{version_id}/quality-rules",
+        json={"rules": []},
+        headers=ctx["headers"],
+    )
+    assert response.status_code == 409
+    assert response.json()["code"] == "BIZ_RESOURCE_CONFLICT"
+
+
+def test_quality_rule_rejects_unknown_target_field(client: TestClient, ctx, stubs):
+    _generate(client, ctx, [PARSE_OK, MATCH_OK, PLAN_V1], stubs)
+    version_id = _versions(client, ctx)[0]["id"]
+
+    response = client.put(
+        f"/api/v1/versions/{version_id}/quality-rules",
+        json={"rules": [{"field": "not_in_mapping", "rule": "not_null",
+                         "error_code": "UNKNOWN_FIELD"}]},
+        headers=ctx["headers"],
+    )
+    assert response.status_code == 409
+    assert "目标字段映射" in response.json()["message"]
+
+
+def test_quality_rule_error_codes_must_be_unique(client: TestClient, ctx, stubs):
+    _generate(client, ctx, [PARSE_OK, MATCH_OK, PLAN_V1], stubs)
+    version_id = _versions(client, ctx)[0]["id"]
+
+    response = client.put(
+        f"/api/v1/versions/{version_id}/quality-rules",
+        json={"rules": [
+            {"field": "order_id", "rule": "not_null", "error_code": "DUPLICATE"},
+            {"field": "order_id", "rule": "regex", "error_code": "DUPLICATE"},
+        ]},
+        headers=ctx["headers"],
+    )
+    assert response.status_code == 409
+    assert "错误码必须唯一" in response.json()["message"]
+
+
+def test_other_maker_cannot_edit_someone_elses_quality_rules(
+    client: TestClient, ctx, stubs, auth_headers
+):
+    _generate(client, ctx, [PARSE_OK, MATCH_OK, PLAN_V1], stubs)
+    version_id = _versions(client, ctx)[0]["id"]
+    other = auth_headers("other.maker@example.com")
+    added = client.post(
+        f"/api/v1/projects/{ctx['project_id']}/members",
+        json={"email": "other.maker@example.com", "role": "maker"},
+        headers=ctx["headers"],
+    )
+    assert added.status_code == 201, added.text
+
+    response = client.put(
+        f"/api/v1/versions/{version_id}/quality-rules",
+        json={"rules": []},
+        headers=other,
+    )
+    assert response.status_code == 403
+    assert response.json()["code"] == "AUTH_PERMISSION_DENIED"
+
+
 def test_freeze_is_idempotent_protected(client: TestClient, ctx, stubs):
     """冻结版本不可重复冻结，更不可修改（FR-19）。"""
     _generate(client, ctx, [PARSE_OK, MATCH_OK, PLAN_V1], stubs)

@@ -221,6 +221,7 @@ def build_budget() -> dict[str, Any]:
         "max_bytes": settings.budget_max_bytes,
         "max_duration_seconds": settings.budget_max_duration_seconds,
         "max_reject_ratio": settings.budget_max_reject_ratio,
+        "max_amplification_ratio": settings.budget_max_amplification_ratio,
     }
 
 

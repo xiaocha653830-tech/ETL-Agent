@@ -1,0 +1,24 @@
+# T-15：常驻 Zeta 单节点集群，REST V2 供控制面 Worker 使用。
+# Doris 的 BE 容器地址只有同一 Docker 网络内可达，因此复用 Doris Compose 创建的网络。
+services:
+  seatunnel-zeta:
+    image: eclipse-temurin:11-jre
+    container_name: etl-seatunnel-zeta
+    working_dir: /opt/seatunnel
+    command: ["bash", "-lc", "exec /opt/seatunnel/bin/seatunnel-cluster.sh"]
+    ports:
+      - "8080:8080"
+    volumes:
+      - ../seatunnel/apache-seatunnel-2.3.13:/opt/seatunnel
+      - seatunnel-logs:/opt/seatunnel/logs
+    networks:
+      - doris-net
+    restart: unless-stopped
+
+networks:
+  doris-net:
+    external: true
+    name: doris_doris-net
+
+volumes:
+  seatunnel-logs:

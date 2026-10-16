@@ -49,7 +49,7 @@ class _Plane:
         self._error = error
         self.calls = 0
 
-    def submit(self, command):
+    def submit(self, command, *, db, on_poll):
         self.calls += 1
         if self._error is not None:
             raise self._error
@@ -267,8 +267,8 @@ def test_cancel_after_submit_prevents_publishing(session_factory, execution_worl
     """提交之后、写终态之前收到取消：不发布结果，落 cancelled。"""
 
     class _CancellingPlane(_Plane):
-        def submit(self, command):
-            outcome = super().submit(command)
+        def submit(self, command, *, db, on_poll):
+            outcome = super().submit(command, db=db, on_poll=on_poll)
             _cancel_from_another_process(session_factory, execution_world.run_id)
             return outcome
 

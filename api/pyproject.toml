@@ -15,6 +15,8 @@ dependencies = [
     "sqlalchemy>=2.0",
     "alembic>=1.13",
     "psycopg[binary]>=3.2",
+    # Doris FE 与演示 MySQL 均使用 MySQL 协议；T-16 的影子表/发布校验由控制面执行。
+    "pymysql>=1.1,<2",
     "redis>=5.0",
     # 异步任务（后续 T-13 启用）
     "celery>=5.4",

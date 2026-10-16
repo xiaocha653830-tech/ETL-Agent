@@ -70,6 +70,8 @@ class ErrorCode(StrEnum):
     BIZ_TOOL_NOT_REGISTERED = "BIZ_TOOL_NOT_REGISTERED"
     # 令牌签名有效，但库中不存在对应签发记录（非本系统签发或记录已清理）
     BIZ_CAPABILITY_NOT_FOUND = "BIZ_CAPABILITY_NOT_FOUND"
+    # 运行超出批准的执行预算，被运行时监督硬中断（FR-36）
+    BIZ_BUDGET_EXCEEDED = "BIZ_BUDGET_EXCEEDED"
 
     # ---- SYS_：系统与依赖 ----
     SYS_INTERNAL_ERROR = "SYS_INTERNAL_ERROR"
@@ -84,6 +86,8 @@ class ErrorCode(StrEnum):
     SYS_MODEL_OUTPUT_INVALID = "SYS_MODEL_OUTPUT_INVALID"
     # 数据面引擎不可达或未接通（M9 适配器）
     SYS_DATAPLANE_UNAVAILABLE = "SYS_DATAPLANE_UNAVAILABLE"
+    SYS_DATAPLANE_JOB_FAILED = "SYS_DATAPLANE_JOB_FAILED"
+    SYS_DATAPLANE_PROTOCOL_ERROR = "SYS_DATAPLANE_PROTOCOL_ERROR"
     # 运行已失去租约（旧 Worker 试图写回终态，或租约被回收）
     SYS_LEASE_LOST = "SYS_LEASE_LOST"
 
@@ -223,6 +227,22 @@ class DataplaneUnavailable(AppError):
     code = ErrorCode.SYS_DATAPLANE_UNAVAILABLE
     status_code = status.HTTP_503_SERVICE_UNAVAILABLE
     message = "数据面引擎不可达"
+
+
+class DataplaneJobFailed(AppError):
+    """SeaTunnel 已返回失败终态；不向外透传引擎原始错误。"""
+
+    code = ErrorCode.SYS_DATAPLANE_JOB_FAILED
+    status_code = status.HTTP_502_BAD_GATEWAY
+    message = "数据面作业执行失败"
+
+
+class DataplaneProtocolError(AppError):
+    """REST 响应缺少关键字段或状态未知，不能把它当作成功。"""
+
+    code = ErrorCode.SYS_DATAPLANE_PROTOCOL_ERROR
+    status_code = status.HTTP_502_BAD_GATEWAY
+    message = "数据面响应不符合协议"
 
 
 class LeaseLost(AppError):

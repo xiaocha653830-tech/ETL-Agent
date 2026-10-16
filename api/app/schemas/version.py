@@ -4,7 +4,15 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
+
+from app.schemas.pipeline import QualityRule
+
+
+class QualityRulesUpdate(BaseModel):
+    """草稿版本的人工质量契约；不接受模型输出替代人工决定。"""
+
+    rules: list[QualityRule] = Field(max_length=100)
 
 
 class VersionSummaryOut(BaseModel):

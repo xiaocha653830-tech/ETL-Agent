@@ -325,6 +325,7 @@ post:
 | API-P10 | POST | `/api/v1/datasources/{id}/test` | 安全连通性测试（只执行 `SELECT 1`） | FR-04 |
 | API-P11 | GET | `/api/v1/datasources/{id}/profiles` | 探查结果历史留档 | FR-07 |
 | API-P12 | GET | `/api/v1/operators`、`/operators/summary`、`/operators/{id}` | 受管算子清单（M4 注册表） | FR-11、FR-14 |
+| API-P13 | PUT | `/api/v1/versions/{id}/quality-rules` | 方案创建人在冻结前声明字段级质量规则；不改变 API-05 契约 | FR-32 |
 
 > **编号约定**：用 `API-P*` 前缀与上表的 10 条契约冻结条目区隔，避免 T-22 前端的契约基线发生漂移。
 > **令牌区分**：本表用的是**登录会话令牌**（HS256 JWT，默认 60 分钟），仅用于接口鉴权；
@@ -484,7 +485,11 @@ sequenceDiagram
 - **可并行**：T-05 与 T-01~T-04 并行；T-20/T-21 与 T-19 并行；T-22 前端可与后端联调并行启动。
 - **强串行**：T-10（安全内核）是 T-11~T-13 的前置，须优先完成。
 
-### 10.1 实施进度（截至 2026-10-14）
+### 10.1 实施进度（截至 2026-10-16）
+
+本节记录当前代码与验证状态，包含本地工作区尚未提交的实现；不调整 PRD 功能范围、
+本规格的任务依赖、接口契约或验收标准。代码已存在、替身测试通过、真实冒烟通过与
+完整验收通过分别记录，不能互相替代。
 
 | 任务 | 状态 | 落地位置 |
 |------|------|---------|
@@ -502,7 +507,15 @@ sequenceDiagram
 | T-12 Commit 收口 | ✅ 完成 | `api/app/services/commit.py`、`api/app/api/routes/commits.py`、`api/app/models/execution.py`（`execution_runs` / `outbox_events`） |
 | T-13 Outbox 分发与任务认领 | ✅ 完成 | `api/app/services/outbox.py`、`api/app/services/execution.py`、`api/app/worker/`（Celery）、`api/app/api/routes/runs.py` |
 | T-14 租约 fencing 与取消 | ✅ 完成 | `api/app/services/lease.py`、`api/app/services/execution.py`、`run_operations` 幂等台账 |
-| T-15 ~ T-23 | ⬜ 未开工 | — |
+| T-15 SeaTunnel REST 适配 | 🟨 已实现、真实冒烟通过、完整受管链路待复验 | `api/app/services/seatunnel.py`、`deploy/seatunnel-zeta.compose.yml`；REST 提交/轮询/停止、冻结指纹复核、参数注入与影子表约束 |
+| T-16 质量与发布 | 🟨 部分实现、完整验收未通过 | `api/app/services/quality.py`、`api/tests/test_quality.py`；规则编译、错误分流、行数/拒绝率/Schema 校验与保留旧表的原子 Swap |
+| T-17 预算监督与诊断 | 🟨 开发中 | `api/app/services/budget.py`、`execution.py`、`seatunnel.py`、`api/tests/test_budget.py`；五维判定、停止请求及失败快照，真实中断与根因诊断待验证/实现 |
+| T-18 受管回滚 | ⬜ 未形成完整实现 | 尚无 API-10 路由与受管回滚执行流程；保留旧表不等同于已实现回滚 |
+| T-19 维护任务 | ⬜ 未实现 | 超时回收、审批过期级联终止与租约回收重排待实现 |
+| T-20 证据账本 | ⬜ 未实现 | 现有运行事件不是哈希链账本；账本落库、校验器与审计报告待实现 |
+| T-21 Benchmark | ⬜ 未实现 | 版本化评测集、分层评测与准确率大盘待实现 |
+| T-22 前端 | 🟨 静态原型阶段 | `docs/prototype/etl-agent.pen`、`docs/prototype-html/`；Vue 业务前端与接口联调未完成 |
+| T-23 全链路联调 | ⬜ 未完成 | 待质量发布、预算监督、回滚及前端等前置任务收口 |
 
 **T-01 的实际落地范围**比任务表描述多两项——统一错误码体系（§6 段位划分）与项目/成员管理（FR-45）。
 二者是后续所有接口的公共地基，放在骨架阶段一次做掉，避免接口变多后再回头改错误契约。
@@ -510,27 +523,70 @@ sequenceDiagram
 **T-07 与 T-06 合并实现**：LangGraph 的中断与恢复是同一套机制，拆成两个任务会产生
 「状态机骨架」和「断点恢复」两份互相耦合的代码。实际落地为 `states → interrupt → resume` 一条链路。
 
-**测试基线**：315 个用例全部通过，覆盖 T-01 ~ T-14。开发环境按 §4 约定使用
-**内存 SQLite + 替身数据源 + 替身模型 + 替身数据面**，不依赖 PostgreSQL / Redis / Vault，
-也不消费大模型额度；Celery 应用可导入、Beat 调度表可断言，但不连 broker。
+**测试记录（2026-10-16）**：最近一次完整检查命令为
+`cd api && ./.venv/Scripts/python.exe -m pytest -q -o addopts= --tb=short`，
+最新结果为 **371 个用例全部通过**（90.88 秒），覆盖 T-01 ~ T-14、REST 适配、
+质量编译与发布替身、预算判定及中断流程。
+此前 `test_worker_records_budget_failure_with_failure_snapshot` 检出越界轮次的
+`read_rows` 应为 12、实际为 0：预算判定提前返回，跳过执行层进度写回。
+工作区已调整为先记录进度/续租、再判定预算，该用例及完整测试均已通过回归。
+本轮仍有 402 条 JWT 测试密钥长度警告，不影响测试通过，但测试结果不代表部署配置已完成安全验收。
+测试按 §4 使用**内存 SQLite + 替身数据源 + 替身模型 + 替身数据面**，不依赖
+PostgreSQL / Redis / Vault，也不消费大模型额度。替身测试不等于真实集群或真实模型验收。
 
-**端到端已验证**：真实 PostgreSQL + LangGraph 断点持久化环境下，
+**控制面历史验证**：真实 PostgreSQL + LangGraph 断点持久化环境下，
 「生成 → 落草稿版本 → 门禁 → 冻结 → Prepare → 双维审批 → Commit（签发令牌 + 写 Outbox）」
 链路跑通，冻结产物的 SHA256 指纹可复算；迁移经 `alembic upgrade head` / `downgrade` 往返
 与 `alembic check`（模型与库零差异）验证。
 
-**M8 的边界（T-15 之前）**：`app/services/execution.py` 只认 `DataPlane` 协议，
-默认实现是 `UnavailableDataPlane`——数据面未接通时运行**明确失败**并落
-`SYS_DATAPLANE_UNAVAILABLE`，而不是空跑成功。T-15 接上 SeaTunnel 适配器后，
-认领、事件、终态写入、幂等台账都不必改动。
+**T-15 的实现与验证边界**：`app/services/execution.py` 通过 `DataPlane` 协议调用数据面。
+默认 `DATA_PLANE_BACKEND=unavailable` 时运行明确失败；显式切换至 `seatunnel` 后，
+适配器从冻结版本取配置、在运行时注入受管连接参数与影子表、经 Tool Broker
+消费单次令牌，再通过 REST V2 提交、轮询与停止作业。已有真实 FakeSource → Console
+及 MySQL → SeaTunnel Zeta → Doris 冒烟记录，后者读取并写入 8 行。
+长表名导致导入 label 超长的问题已通过缩短受管运行前缀修正，但完整受管链路仍需稳定复验。
+
+**T-16 的实现与验证边界**：FR-32 的规则声明纳入冻结指纹；执行阶段将规则编译为
+SeaTunnel `DataValidator` 多表分流配置。当前只执行 `not_null` / `regex` 的 `reject` 规则，
+`range` / `enum` / `warn` 等不支持的规则会明确阻止执行，不能静默跳过或据此缩减需求基线。
+发布前检查源端行数等于有效行数加错误行数、拒绝率未越过批准预算、两表 Schema 一致，
+再执行 `REPLACE WITH TABLE ... PROPERTIES('swap'='true')`，旧正式表保留在影子表名下。
+质量报告目前保存在运行事件快照中，尚无独立 `QUALITY_REPORT` 实体与报告查询接口。
+
+真实独立冒烟曾验证 8 行源数据分为 7 行有效、1 行错误，并在隔离演示表上完成原子 Swap。
+但最近一次受管演示运行 `76020184-bc9d-4b5f-8944-fdeeb8297619` 返回 `succeeded` 后，
+核对结果为正式演示表 8 行、影子表 8 行、错误表 0 行，未证明该场景预期的 7/1 分流成立。
+该差异原因仍待核实，不能仅凭成功状态把 FR-33/FR-34 标为验收通过。
+固定方案种子绕过真实模型生成，仅用于数据链路验证；演示账号双审是角色隔离的技术模拟，
+不替代独立人员的生产审批。
+
+**T-17 的实现与验证边界**：`budget.evaluate` 纯函数按准备单预算判定行数、字节、时长、
+放大比与拒绝率；适配器逐轮采集度量，越界时请求停止，并以 `BIZ_BUDGET_EXCEEDED`
+失败终态及 `run.budget_exceeded` 快照留痕。结束轮次发现越界也应阻止发布。
+未声明预算或本轮无法观测的比值维度会跳过判定；缺失度量不能被解释为已满足全部预算。
+目前停止路径核对请求回执，尚需真实引擎验证终止结果；可解释根因诊断与修复建议未完成。
 
 **仍未闭环**：
 
-1. §11.1 的 V3（DeepSeek API 可用性）尚未实测。当前开发与测试全部走 `LLM_BACKEND=fake`，
-   真实模型联调前必须先完成 V3 验证。
-2. **数据面未接通**（T-15）：受管执行目前必然以 `SYS_DATAPLANE_UNAVAILABLE` 收敛。
-3. **租约回收未实现**（T-19）：租约过期的运行不会被自动回收重排，须由维护任务补上；
-   fencing 已就位，回收后旧 Worker 的写回会被拒绝。
+1. **真实模型验证**：§11.1 的 V3（DeepSeek API 可用性）尚无实测闭环证据；
+   替身模型与固定方案不能证明 PRD 的生成准确率验收指标。
+2. **受管质量发布验收**：查明最近一次演示分流结果不一致的原因，核对冻结规则、
+   实际执行配置、质量报告、发布结果与运行审计，并补齐报告查询能力。
+3. **预算监督验收**：指标写回修复已通过回归；仍需验证真实超预算停止、失败快照及不发布，
+   补齐可解释诊断。发布前的取消与租约边界也需覆盖。
+4. **恢复、审计与前端**：按 T-18～T-23 补齐回滚、维护回收、证据账本、Benchmark、
+   Vue 业务页面及全链路演示；现有 fencing、旧表保留、运行事件和静态原型不是这些任务的替代实现。
+5. **演示环境**：2026-10-16 检查时，项目容器仅 SeaTunnel 在运行，PostgreSQL、Redis、
+   演示 MySQL 和 Doris 未运行；该项是检查时快照，完整复验前须重新确认环境。
+
+### 10.2 下一步推进顺序
+
+1. 收口 T-15/T-16：复现并解释受管分流差异，补齐质量报告；验证 8 行输入、7 行发布、
+   1 行错误且旧正式表保留的隔离演示，并验证质量或预算失败时不发布。
+2. 在预算判定与指标写回回归通过的基础上，收口 T-17 的真实中断与诊断，
+   再按依赖推进 T-18 受管回滚。
+3. 推进 T-19 维护回收及 T-20/T-21 审计评测；在依赖和接口就绪后完成 T-22 Vue 前端，
+   最后以 T-23 汇总真实模型、数据链路、异常恢复、审批审计与页面操作的验收证据。
 
 ## 11. 待明确事项
 

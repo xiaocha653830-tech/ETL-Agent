@@ -63,6 +63,10 @@ class Settings(BaseSettings):
     budget_max_bytes: int = 2_147_483_648  # 2 GiB
     budget_max_duration_seconds: int = 1800  # 30 min
     budget_max_reject_ratio: float = 0.2
+    # 放大比 = 写入字节 / 读取字节（FR-35）。兜底默认取 3.0：多出来的两倍余量
+    # 留给 explode 一类合法的行扩张算子。真正危险的是「声明里没有的连接」——
+    # 误写的笛卡尔积会把放大比推到几十上百倍，这才是硬中断要拦的东西。
+    budget_max_amplification_ratio: float = 3.0
 
     # ---- 异步执行层（M8，FR-28 / FR-29）----
     # Outbox 投递失败后的指数退避基数与上限（秒）
@@ -75,6 +79,14 @@ class Settings(BaseSettings):
     run_heartbeat_seconds: int = 30
     # Outbox 分发任务的触发间隔（Celery beat）
     outbox_dispatch_interval_seconds: int = 15
+
+    # ---- SeaTunnel Zeta REST V2（T-15）----
+    # 显式启用真实数据面；开发环境默认保持不可用，以免误把测试作业提交到集群。
+    data_plane_backend: Literal["unavailable", "seatunnel"] = "unavailable"
+    seatunnel_base_url: str = "http://127.0.0.1:8080"
+    seatunnel_http_timeout_seconds: float = 10.0
+    seatunnel_poll_interval_seconds: float = 5.0
+    seatunnel_job_timeout_seconds: int = 1800
 
     @model_validator(mode="after")
     def _validate_secret_key(self) -> "Settings":

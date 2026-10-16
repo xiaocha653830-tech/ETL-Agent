@@ -47,10 +47,10 @@ class QualityRule(BaseModel):
     生成阶段只做结构性占位，取值必须人工填写。
     """
 
-    field: str
+    field: str = Field(min_length=1, max_length=128)
     rule: Literal["not_null", "range", "enum", "regex"]
     params: dict[str, Any] = Field(default_factory=dict)
-    error_code: str = Field(max_length=64)
+    error_code: str = Field(min_length=1, max_length=64)
     action: Literal["reject", "warn"] = "reject"
 
 

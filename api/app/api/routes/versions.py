@@ -16,10 +16,15 @@ from app.core.config import settings
 from app.core.errors import ResourceNotFound
 from app.models.identity import Membership, User, UserRole
 from app.models.version import PipelineVersion, VersionStatus
-from app.schemas.version import VersionDiffOut, VersionOut, VersionSummaryOut
+from app.schemas.version import (
+    QualityRulesUpdate,
+    VersionDiffOut,
+    VersionOut,
+    VersionSummaryOut,
+)
 from app.services.endpoint_context import EndpointContext
 from app.services.gate import run_gate
-from app.services.versioning import diff_versions, freeze_version
+from app.services.versioning import diff_versions, freeze_version, set_quality_rules
 
 router = APIRouter(prefix="/versions", tags=["versions"])
 
@@ -90,6 +95,19 @@ def freeze(
         strict=settings.app_env != "dev",
     )
     return freeze_version(db, version=version, report=report)
+
+
+@router.put("/{version_id}/quality-rules", response_model=VersionOut)
+def update_quality_rules(
+    version_id: uuid.UUID,
+    payload: QualityRulesUpdate,
+    user: CurrentUser,
+    db: DbSession,
+) -> PipelineVersion:
+    """FR-32：由方案创建人在冻结前填写质量规则，不改变 API-05 冻结契约。"""
+    version, membership = _authorized_version(db, version_id, user)
+    ensure_role(membership, UserRole.MAKER)
+    return set_quality_rules(db, version=version, user_id=user.id, rules=payload.rules)
 
 
 @router.get("", response_model=list[VersionSummaryOut])
